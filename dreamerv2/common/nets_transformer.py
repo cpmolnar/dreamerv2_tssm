@@ -40,7 +40,6 @@ class EnsembleTSSM(common.Module):
 
   @tf.function
   def observe(self, embeds, actions, is_first, states=None):
-    swap = lambda x: tf.transpose(x, [len(x.shape)-1] + list(range(len(x.shape)-1)))
     if states is None:
       batch_size, seq_len = tf.shape(actions)[:2]
       states = self.initial(batch_size, seq_len)
@@ -92,7 +91,7 @@ class EnsembleTSSM(common.Module):
     stats = self._suff_stats_layer('obs_dist', x)
     dist = self.get_dist(stats)
     stoch = dist.sample() if sample else dist.mode()
-    post = {'stoch': stoch, 'deter': prior['deter'], **stats} # z_t\hat
+    post = {'stoch': stoch, 'deter': prior['deter'], **stats} # z_t\hat, h_t
     return post, prior
 
   @tf.function
@@ -110,8 +109,8 @@ class EnsembleTSSM(common.Module):
     x = self.get('img_in_norm', common.NormLayer, self._norm)(x)
     x = self._act(x)
 
-    deter = states['deter']
-    stats = self._suff_stats_ensemble(x)
+    deter = x
+    stats = self._suff_stats_ensemble(deter)
     index = tf.random.uniform((), 0, self._ensemble, tf.int32)
     stats = {k: v[index] for k, v in stats.items()}
     dist = self.get_dist(stats)

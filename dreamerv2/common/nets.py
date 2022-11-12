@@ -66,11 +66,11 @@ class EnsembleRSSM(common.Module):
     return prior
 
   def get_feat(self, state):
-    stoch = self._cast(state['stoch'])
+    stoch = self._cast(state['stoch']) # z_t\hat
     if self._discrete:
       shape = stoch.shape[:-2] + [self._stoch * self._discrete]
       stoch = tf.reshape(stoch, shape)
-    return tf.concat([stoch, state['deter']], -1)
+    return tf.concat([stoch, state['deter']], -1) # z_t\hat, h_t
 
   def get_dist(self, state, ensemble=False):
     if ensemble:

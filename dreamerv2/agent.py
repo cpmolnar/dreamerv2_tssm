@@ -104,14 +104,14 @@ class WorldModel(common.Module):
 
   def loss(self, data, state=None):
     data = self.preprocess(data)
-    embed = self.encoder(data)
+    embed = self.encoder(data) # z_t
     post, prior = self.rssm.observe(
-        embed, data['action'], data['is_first'], state)
+        embed, data['action'], data['is_first'], state) # out: z_t\hat, z_t. in: z_t, a_t
     kl_loss, kl_value = self.rssm.kl_loss(post, prior, **self.config.kl)
     assert len(kl_loss.shape) == 0
     likes = {}
     losses = {'kl': kl_loss}
-    feat = self.rssm.get_feat(post)
+    feat = self.rssm.get_feat(post) # z_t\hat, h_t
     for name, head in self.heads.items():
       grad_head = (name in self.config.grad_heads)
       inp = feat if grad_head else tf.stop_gradient(feat)
