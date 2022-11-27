@@ -95,6 +95,7 @@ def train(env, config, outputs=None):
     driver.reset()
 
   print('Create agent.')
+  assert config.ssm_type in ['rnn', 'transformer'], 'ssm_type must be one of ["rnn", "transformer"].'
   if config.ssm_type=='rnn': agnt = agent.Agent(config, env.obs_space, env.act_space, step)
   elif config.ssm_type=='transformer': agnt = agent_transformer.Agent(config, env.obs_space, env.act_space, step)
   dataset = iter(replay.dataset(**config.dataset))

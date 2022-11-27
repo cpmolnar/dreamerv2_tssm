@@ -401,7 +401,7 @@ class NormLayer(common.Module):
   def __call__(self, features):
     if not self._layer:
       return features
-    return self._layer(features)
+    return tfkl.LayerNormalization()(features)
 
 
 def get_act(name):

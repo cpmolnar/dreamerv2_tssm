@@ -39,11 +39,20 @@ class EnsembleTSSM(common.Module):
     return state
 
   @tf.function
-  def observe(self, embeds, actions, is_first, states=None):
-    if states is None:
-      batch_size, seq_len = tf.shape(actions)[:2]
-      states = self.initial(batch_size, seq_len)
-    post, prior = self.obs_step(states, actions, embeds, is_first)
+  def observe(self, embeds, actions, is_first):
+    '''
+    input:
+      embeds:       x_t
+      actions:      a_t
+      state.stoch:  z_t\hat
+      state.deter:  h_t\hat
+      state.logit:
+
+    '''
+    # if states is None:
+    #   batch_size, seq_len = tf.shape(actions)[:2]
+    #   states = self.initial(batch_size, seq_len)
+    post, prior = self.obs_step(actions, embeds, is_first)
     return post, prior
 
   @tf.function
@@ -51,7 +60,7 @@ class EnsembleTSSM(common.Module):
     if state is None:
       state = self.initial(tf.shape(actions)[0])
     assert isinstance(state, dict), state
-    prior = self.img_step(state, actions)
+    prior = self.img_step(state['stoch'], actions)
     return prior
 
   def get_feat(self, state):
@@ -67,7 +76,7 @@ class EnsembleTSSM(common.Module):
     if self._discrete:
       logit = state['logit']
       logit = tf.cast(logit, tf.float32)
-      dist = tfd.Independent(common.OneHotDist(logit), 2)
+      dist = tfd.Independent(common.OneHotDist(logit), 1)
     else:
       mean, std = state['mean'], state['std']
       mean = tf.cast(mean, tf.float32)
@@ -76,46 +85,66 @@ class EnsembleTSSM(common.Module):
     return dist
 
   @tf.function
-  def obs_step(self, states, actions, embeds, is_first, sample=True):
+  def obs_step(self, actions, embeds, is_first, sample=True):
+    '''
+    input:
+      embeds:       x_t
+      actions:      a_t
+    calculates:
+      stochs:       z_t
+    output:
+      post.stoch:   z_t
+      post.deter:   h_t
+      prior.stoch:  z_t\hat
+      prior.deter:  h_t
+    '''
     if len(is_first.shape)<2: 
         is_first=is_first.reshape([1,1])
         embeds=embeds.reshape([1,1,-1])
     # Zero out firsts
-    states, actions = tf.nest.map_structure(
-        lambda x: tf.einsum('bl,bl...->bl...', 1.0 - is_first.astype(x.dtype), x), (states, actions))
-    prior = self.img_step(states, actions, sample) # z_t
-    x = tf.concat([prior['deter'], embeds], -1)
-    x = self.get('obs_out', tfkl.Dense, self._hidden)(x)
+    actions = tf.nest.map_structure(
+        lambda x: tf.einsum('bl,bl...->bl...', 1.0 - is_first.astype(x.dtype), x), (actions))
+
+    x = self.get('obs_out', tfkl.Dense, self._hidden)(embeds)
     x = self.get('obs_out_norm', common.NormLayer, self._norm)(x)
-    x = self._act(x)
+    stochs = self._act(x)  # z_t | x_t
+
+    prior = self.img_step(stochs, actions, sample) # z_t\hat | h_t, h_t | z_t, a_t
+
     stats = self._suff_stats_layer('obs_dist', x)
     dist = self.get_dist(stats)
-    stoch = dist.sample() if sample else dist.mode()
-    post = {'stoch': stoch, 'deter': prior['deter'], **stats} # z_t\hat, h_t
+    stochs = dist.sample() if sample else dist.mode()
+    post = {'stoch': stochs, 'deter': prior['deter'], **stats} # z_t | x_t, h_t | z_t, a_t
     return post, prior
 
   @tf.function
-  def img_step(self, states, actions, sample=True):
-    stochs = self._cast(states['stoch'])
-    batch_size, seq_len, _, _ = stochs.shape
+  def img_step(self, stochs, actions, sample=True):
+    '''
+    input:
+      states.stoch:   z_t
+      actions:        a_t 
+    output:
+      states.stoch:   z_t\hat
+      states.deter:   h_t\hat
+    '''
+    stochs = self._cast(stochs)
     actions = self._cast(actions)
-    if self._discrete:
-      shape = [batch_size, seq_len, self._stoch * self._discrete]
+    if self._discrete and stochs.shape[-1]!=self._stoch * self._discrete:
+      shape = stochs.shape[:-2] + [self._stoch * self._discrete]
       stochs = tf.reshape(stochs, shape)
 
-    x = tf.concat([stochs, actions], -1)
-    x = self.get('img_in', AttentionEncoder, num_layers=4, d_model=self._hidden, num_heads=1, dff=2048)(x)
+    x = tf.concat([stochs, actions], -1) # z_t, a_t
     x = self.get('img_out', tfkl.Dense, self._hidden)(x)
     x = self.get('img_in_norm', common.NormLayer, self._norm)(x)
     x = self._act(x)
+    deter = self.get('img_in', AttentionEncoder, num_layers=4, d_model=self._hidden, num_heads=1, dff=2048)(x) # h_t | z_t, a_t
 
-    deter = x
     stats = self._suff_stats_ensemble(deter)
     index = tf.random.uniform((), 0, self._ensemble, tf.int32)
     stats = {k: v[index] for k, v in stats.items()}
     dist = self.get_dist(stats)
-    stoch = dist.sample() if sample else dist.mode()
-    prior = {'stoch': stoch, 'deter': deter, **stats}
+    stochs = dist.sample() if sample else dist.mode()
+    prior = {'stoch': stochs, 'deter': deter, **stats}
     return prior
 
   def _suff_stats_ensemble(self, inp):
@@ -195,7 +224,10 @@ class PositionalEmbedding(tfkl.Layer):
     return self.embedding.compute_mask(*args, **kwargs)
 
   def call(self, x):
-    length = tf.shape(x)[1]
+    if len(x.shape)>2:
+      length = tf.shape(x)[1]
+    else:
+      length = 1
     x = self.embedding(x)
     # This factor sets the relative scale of the embedding and positonal_encoding.
     x *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))

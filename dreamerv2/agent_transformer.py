@@ -36,7 +36,7 @@ class Agent(common.Module):
     embed = self.wm.encoder(self.wm.preprocess(obs))
     sample = (mode == 'train') or not self.config.eval_state_mean
     latent, _ = self.wm.tssm.obs_step(
-        latent, action, embed, obs['is_first'], sample)
+        action, embed, obs['is_first'], sample)
     feat = self.wm.tssm.get_feat(latent)
     if mode == 'eval':
       actor = self._task_behavior.actor(feat)
@@ -57,7 +57,14 @@ class Agent(common.Module):
 
   @tf.function
   def train(self, data, state=None):
+    '''
+    data
+      image: x_t
+      reward: r_t
+    '''
+    
     metrics = {}
+    
     self.state, outputs, mets = self.wm.train(data, state)
     metrics.update(mets)
     start = outputs['post']
@@ -97,22 +104,32 @@ class TransformerWorldModel(common.Module):
     self.model_opt = common.Optimizer('model', **config.model_opt)
 
   def train(self, data, state=None):
+    '''
+    data
+      image: x_t
+      reward: r_t
+    '''
     with tf.GradientTape() as model_tape:
-      model_loss, state, outputs, metrics = self.loss(data, state)
+      model_loss, state, outputs, metrics = self.loss(data)
     modules = [self.encoder, self.tssm, *self.heads.values()]
     metrics.update(self.model_opt(model_tape, model_loss, modules))
     return state, outputs, metrics
 
-  def loss(self, data, state=None):
+  def loss(self, data):
+    '''
+    input:
+      data.image:   x_t
+      data.action:  a_t
+      data.reward:  r_t
+    '''
     data = self.preprocess(data)
-    embed = self.encoder(data)
-    post, prior = self.tssm.observe(
-        embed, data['action'], data['is_first'], state)
+    embed = self.encoder(data) # embed: x_t
+    post, prior = self.tssm.observe(embed, data['action'], data['is_first'])
     kl_loss, kl_value = self.tssm.kl_loss(post, prior, **self.config.kl)
     assert len(kl_loss.shape) == 0
     likes = {}
     losses = {'kl': kl_loss}
-    feat = self.tssm.get_feat(post)
+    feat = self.tssm.get_feat(post) # z_t, h_t
     for name, head in self.heads.items():
       grad_head = (name in self.config.grad_heads)
       inp = feat if grad_head else tf.stop_gradient(feat)
@@ -139,7 +156,7 @@ class TransformerWorldModel(common.Module):
     seq = {k: [v] for k, v in start.items()}
     for _ in range(horizon):
       action = policy(tf.stop_gradient(seq['feat'][-1])).sample()
-      state = self.tssm.img_step({k: v[-1] for k, v in seq.items()}, action)
+      state = self.tssm.img_step({k: v[-1] for k, v in seq.items()}['stoch'], action)
       feat = self.tssm.get_feat(state)
       for key, value in {**state, 'action': action, 'feat': feat}.items():
         seq[key].append(value)
@@ -235,6 +252,7 @@ class ActorCritic(common.Module):
     with tf.GradientTape() as actor_tape:
       seq = world_model.imagine(self.actor, start, is_terminal, hor)
       reward = reward_fn(seq)
+      self.rewnorm._shape = ()
       seq['reward'], mets1 = self.rewnorm(reward)
       mets1 = {f'reward_{k}': v for k, v in mets1.items()}
       target, mets2 = self.target(seq)
