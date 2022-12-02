@@ -188,10 +188,10 @@ class WorldModel(common.Module):
   def video_pred(self, data, key):
     decoder = self.heads['decoder']
     truth = data[key][:6] + 0.5
-    embed = self.encoder(data)
+    embed = self.encoder(data) # x_t
     states, _ = self.rssm.observe(
-        embed[:6, :5], data['action'][:6, :5], data['is_first'][:6, :5])
-    recon = decoder(self.rssm.get_feat(states))[key].mode()[:6]
+        embed[:6, :5], data['action'][:6, :5], data['is_first'][:6, :5]) # get z_t, h_t
+    recon = decoder(self.rssm.get_feat(states))[key].mode()[:6] # get x_t\hat
     init = {k: v[:, -1] for k, v in states.items()}
     prior = self.rssm.imagine(data['action'][:6, 5:], init)
     openl = decoder(self.rssm.get_feat(prior))[key].mode()

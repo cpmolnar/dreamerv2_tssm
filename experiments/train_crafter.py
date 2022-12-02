@@ -7,19 +7,21 @@ sys.path.append(str(pathlib.Path(__file__).parent.parent))
 import dreamerv2.api as dv2
 from dreamerv2.train_with_configs import main
 
+logdir_path = r'C:\Users\Carl\OneDrive\Desktop'
 task = 'crafter_reward'
-ssm_type = 'rssm'
+ssm_type = 'tssm'
 
 config = dv2.defaults.update({
     'task': task,
     'jit': False,
     'time_limit': 100,
     'eval_every': 300,
-    'log_every': 300,
+    'log_every': 100,
     'prefill': 100,
     'pretrain': 1,
     'train_steps': 1,
-    'logdir': f'~/logdir/{task}/{ssm_type}',
+    # 'logdir': f'{logdir_path}/logdir/{task}/{ssm_type}',
+    'logdir': f'{logdir_path}/logdir/{task}/test2',
     'actor_ent': 3e-3,
     'loss_scales.kl': 1.0,
     'ssm_type': ssm_type,

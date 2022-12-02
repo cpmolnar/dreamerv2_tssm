@@ -22,6 +22,8 @@ class EnsembleTSSM(common.Module):
     self._std_act = std_act
     self._min_std = min_std
     self._cast = lambda x: tf.cast(x, prec.global_policy().compute_dtype)
+    self.transformer_loss = None
+    self.transformer_opt = common.Optimizer('transformer', **{'opt': 'adam', 'lr': 8e-5, 'eps': 1e-5, 'clip': 100, 'wd': 1e-6})
 
   def initial(self, batch_size, seq_len=1):
     dtype = prec.global_policy().compute_dtype
@@ -47,7 +49,11 @@ class EnsembleTSSM(common.Module):
       state.stoch:  z_t\hat
       state.deter:  h_t\hat
       state.logit:
-
+    output:
+      post.stoch:   z_t
+      post.deter:   h_t
+      prior.stoch:  z_t\hat
+      prior.deter:  h_t
     '''
     # if states is None:
     #   batch_size, seq_len = tf.shape(actions)[:2]
@@ -57,11 +63,22 @@ class EnsembleTSSM(common.Module):
 
   @tf.function
   def imagine(self, actions, state=None):
+    '''
+    input:
+      actions:      a_t
+      state.stoch:  z_t
+    output:
+      prior.stoch:  z_t\hat
+      prior.deter:  h_t
+      '''
     if state is None:
       state = self.initial(tf.shape(actions)[0])
     assert isinstance(state, dict), state
-    prior = self.img_step(state['stoch'], actions)
-    return prior
+    batch_size, seq_len, _ = actions.shape
+    while state['stoch'].shape[1]!=seq_len:
+      prior = self.img_step(state['stoch'], actions)
+      state['stoch'] = tf.concat([state['stoch'], tf.expand_dims(prior['stoch'][:,-1], 1)], 1)
+    return self.img_step(state['stoch'], actions)
 
   def get_feat(self, state):
     stoch = self._cast(state['stoch'])
@@ -109,35 +126,57 @@ class EnsembleTSSM(common.Module):
     x = self.get('obs_out_norm', common.NormLayer, self._norm)(x)
     stochs = self._act(x)  # z_t | x_t
 
-    prior = self.img_step(stochs, actions, sample) # z_t\hat | h_t, h_t | z_t, a_t
+    prior = self.img_step(stochs, actions, sample) # (z_t\hat | h_t), (h_t | z_t, a_t)
 
     stats = self._suff_stats_layer('obs_dist', x)
     dist = self.get_dist(stats)
     stochs = dist.sample() if sample else dist.mode()
-    post = {'stoch': stochs, 'deter': prior['deter'], **stats} # z_t | x_t, h_t | z_t, a_t
+    post = {'stoch': stochs, 'deter': prior['deter'], **stats} # (z_t | x_t), (h_t | z_t, a_t)
     return post, prior
 
   @tf.function
   def img_step(self, stochs, actions, sample=True):
     '''
     input:
-      states.stoch:   z_t
+      stochs:         z_t
       actions:        a_t 
     output:
-      states.stoch:   z_t\hat
-      states.deter:   h_t\hat
+      prior.stochs:   z_t\hat
+      prior.deter:    h_t
     '''
     stochs = self._cast(stochs)
     actions = self._cast(actions)
     if self._discrete and stochs.shape[-1]!=self._stoch * self._discrete:
       shape = stochs.shape[:-2] + [self._stoch * self._discrete]
       stochs = tf.reshape(stochs, shape)
+    batch_size, seq_len, _ = stochs.shape
 
-    x = tf.concat([stochs, actions], -1) # z_t, a_t
+    # with tf.GradientTape() as transformer_tape:
+    x = tf.concat([stochs, actions[:,:seq_len]], -1) # z_t, a_t
     x = self.get('img_out', tfkl.Dense, self._hidden)(x)
     x = self.get('img_in_norm', common.NormLayer, self._norm)(x)
-    x = self._act(x)
-    deter = self.get('img_in', AttentionEncoder, num_layers=4, d_model=self._hidden, num_heads=1, dff=2048)(x) # h_t | z_t, a_t
+    token_embeds = self._act(x)
+    # tokens = self.get('img_softargmax', common.Softargmax)(x)
+
+    token_embeds = tf.concat([tf.zeros(shape=(batch_size, 1, self._hidden)), token_embeds], axis=1)
+    # token_embeds = tf.keras.preprocessing.sequence.pad_sequences(token_embeds, maxlen=seq_len+1, padding='pre', dtype='float32')
+
+    # with tf.device('cpu:0'):
+    #   embedding_layer = self.get('in_embedding', tfkl.Embedding, input_dim=4096, output_dim=self._hidden, mask_zero=True)
+    #   embedding_layer.build(input_shape=4096)
+    # token_embeds = embedding_layer(tokens)
+    input_embeds, target_embeds = token_embeds[:,:-1], token_embeds[:,1:]
+
+    transformer = self.get('img_transformer', common.Transformer, num_layers=1, d_model=self._hidden, 
+                            num_heads=1, dff=512, vocab_size=self._hidden, dropout_rate=0.1)
+
+    deter = transformer((input_embeds, target_embeds),) # h_t | z_t, a_t
+    loss_fn = tf.losses.CosineSimilarity(axis=-1)
+    self.transformer_loss = loss_fn(target_embeds, deter)
+      # print(f'{"Transformer loss:":25s} {transformer_loss.numpy()}')
+    # self.transformer_opt(transformer_tape, self.transformer_loss, transformer)
+    # pred_tokens = self.get('img_softargmax', common.Softargmax)(preds)
+    # deter = self.get('in_embedding', tfkl.Embedding, input_dim=4096, output_dim=self._hidden, mask_zero=True)(pred_tokens)
 
     stats = self._suff_stats_ensemble(deter)
     index = tf.random.uniform((), 0, self._ensemble, tf.int32)
@@ -197,119 +236,3 @@ class EnsembleTSSM(common.Module):
         loss_rhs = tf.maximum(value_rhs, free).mean()
       loss = mix * loss_lhs + (1 - mix) * loss_rhs
     return loss, value
-
-def positional_encoding(length, depth):
-  depth = depth/2
-
-  positions = np.arange(length)[:, np.newaxis]     # (seq, 1)
-  depths = np.arange(depth)[np.newaxis, :]/depth   # (1, depth)
-
-  angle_rates = 1 / (10000**depths)         # (1, depth)
-  angle_rads = positions * angle_rates      # (pos, depth)
-
-  pos_encoding = np.concatenate(
-      [np.sin(angle_rads), np.cos(angle_rads)],
-      axis=-1) 
-
-  return tf.cast(pos_encoding, dtype=tf.float32)
-
-class PositionalEmbedding(tfkl.Layer):
-  def __init__(self, d_model):
-    super().__init__()
-    self.d_model = d_model
-    self.embedding = tfkl.Dense(d_model) 
-    self.pos_encoding = positional_encoding(length=2048, depth=d_model)
-
-  def compute_mask(self, *args, **kwargs):
-    return self.embedding.compute_mask(*args, **kwargs)
-
-  def call(self, x):
-    if len(x.shape)>2:
-      length = tf.shape(x)[1]
-    else:
-      length = 1
-    x = self.embedding(x)
-    # This factor sets the relative scale of the embedding and positonal_encoding.
-    x *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
-    x = x + self.pos_encoding[tf.newaxis, :length, :]
-    return x
-
-class BaseAttention(tfkl.Layer):
-  def __init__(self, **kwargs):
-    super().__init__()
-    self.mha = tfkl.MultiHeadAttention(**kwargs)
-    self.layernorm = tf.keras.layers.LayerNormalization()
-    self.add = tf.keras.layers.Add()
-
-class CausalSelfAttention(BaseAttention):
-  def call(self, x):
-    attn_output = self.mha(
-        query=x,
-        value=x,
-        key=x,
-        use_causal_mask = True)
-    x = self.add([x, attn_output])
-    x = self.layernorm(x)
-    return x
-
-class FeedForward(tf.keras.layers.Layer):
-  def __init__(self, d_model, dff, dropout_rate=0.1):
-    super().__init__()
-    self.seq = tf.keras.Sequential([
-      tfkl.Dense(dff, activation='relu'),
-      tfkl.Dense(d_model),
-      tfkl.Dropout(dropout_rate)
-    ])
-    self.add = tf.keras.layers.Add()
-    self.layer_norm = tf.keras.layers.LayerNormalization()
-
-  def call(self, x):
-    x = self.add([x, self.seq(x)])
-    x = self.layer_norm(x) 
-    return x
-
-class EncoderLayer(tf.keras.layers.Layer):
-  def __init__(self,*, d_model, num_heads, dff, dropout_rate=0.1):
-    super().__init__()
-
-    self.self_attention = CausalSelfAttention(
-        num_heads=num_heads,
-        key_dim=d_model,
-        dropout=dropout_rate)
-
-    self.ffn = FeedForward(d_model, dff)
-
-  def call(self, x):
-    x = self.self_attention(x)
-    x = self.ffn(x)
-    return x
-
-class AttentionEncoder(tf.keras.layers.Layer):
-  def __init__(self, *, num_layers, d_model, num_heads,
-               dff, dropout_rate=0.1):
-    super().__init__()
-
-    self.d_model = d_model
-    self.num_layers = num_layers
-
-    self.pos_embedding = PositionalEmbedding(d_model=d_model)
-
-    self.enc_layers = [
-        EncoderLayer(d_model=d_model,
-                     num_heads=num_heads,
-                     dff=dff,
-                     dropout_rate=dropout_rate)
-        for _ in range(num_layers)]
-    self.dropout = tf.keras.layers.Dropout(dropout_rate)
-
-  def call(self, x):
-    # `x` is token-IDs shape: (batch, seq_len)
-    x = self.pos_embedding(x)  # Shape `(batch_size, seq_len, d_model)`.
-
-    # Add dropout.
-    x = self.dropout(x)
-
-    for i in range(self.num_layers):
-      x = self.enc_layers[i](x)
-
-    return x  # Shape `(batch_size, seq_len, d_model)`.

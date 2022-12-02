@@ -4,7 +4,6 @@ from tensorflow.keras import mixed_precision as prec
 import common
 import expl
 
-
 class Agent(common.Module):
 
   def __init__(self, config, obs_space, act_space, step):
@@ -109,7 +108,7 @@ class TransformerWorldModel(common.Module):
       image: x_t
       reward: r_t
     '''
-    with tf.GradientTape() as model_tape:
+    with tf.GradientTape(persistent=True) as model_tape:
       model_loss, state, outputs, metrics = self.loss(data)
     modules = [self.encoder, self.tssm, *self.heads.values()]
     metrics.update(self.model_opt(model_tape, model_loss, modules))
@@ -126,9 +125,10 @@ class TransformerWorldModel(common.Module):
     embed = self.encoder(data) # embed: x_t
     post, prior = self.tssm.observe(embed, data['action'], data['is_first'])
     kl_loss, kl_value = self.tssm.kl_loss(post, prior, **self.config.kl)
+    transformer_loss = self.tssm.transformer_loss
     assert len(kl_loss.shape) == 0
     likes = {}
-    losses = {'kl': kl_loss}
+    losses = {'kl': kl_loss, 'transformer': transformer_loss}
     feat = self.tssm.get_feat(post) # z_t, h_t
     for name, head in self.heads.items():
       grad_head = (name in self.config.grad_heads)
@@ -148,6 +148,7 @@ class TransformerWorldModel(common.Module):
     metrics['model_kl'] = kl_value.mean()
     metrics['prior_ent'] = self.tssm.get_dist(prior).entropy().mean()
     metrics['post_ent'] = self.tssm.get_dist(post).entropy().mean()
+    metrics['transformer_loss'] = self.tssm.transformer_loss
     return model_loss, post, outs, metrics
 
   def imagine(self, policy, start, is_terminal, horizon):
@@ -203,14 +204,13 @@ class TransformerWorldModel(common.Module):
   def video_pred(self, data, key):
     decoder = self.heads['decoder']
     truth = data[key][:6] + 0.5
-    embed = self.encoder(data)
+    embed = self.encoder(data) # x_t
     states, _ = self.tssm.observe(
-        embed[:6], data['action'][:6], data['is_first'][:6])
-    recon = decoder(self.tssm.get_feat(states))[key].mode()[:6, :5]
-    init = {k: v[:, 5:] for k, v in states.items()}
-    prior = self.tssm.imagine(data['action'][:6, 5:], init)
+        embed[:6, :5], data['action'][:6, :5], data['is_first'][:6, :5]) # get z_t, h_t
+    recon = decoder(self.tssm.get_feat(states))[key].mode()[:6] # get x_t\hat
+    prior = self.tssm.imagine(data['action'][:6], states)
     openl = decoder(self.tssm.get_feat(prior))[key].mode()
-    model = tf.concat([recon[:, :5] + 0.5, openl + 0.5], 1)
+    model = tf.concat([recon[:, :5] + 0.5, openl[:,5:] + 0.5], 1)
     error = (model - truth + 1) / 2
     video = tf.concat([truth, model, error], 2)
     B, T, H, W, C = video.shape
