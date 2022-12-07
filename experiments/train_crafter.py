@@ -21,7 +21,7 @@ config = dv2.defaults.update({
     'pretrain': 1,
     'train_steps': 1,
     # 'logdir': f'{logdir_path}/logdir/{task}/{ssm_type}',
-    'logdir': f'{logdir_path}/logdir/{task}/test2',
+    'logdir': f'{logdir_path}/logdir/{task}/tssm_encoder_decoder_test',
     'actor_ent': 3e-3,
     'loss_scales.kl': 1.0,
     'ssm_type': ssm_type,
@@ -40,12 +40,5 @@ config = dv2.defaults.update({
     'critic_opt.lr': 1e-4,
     '.*\.norm': 'layer',
 }).parse_flags()
-
-# assert config.action_repeat == 1
-
-# suite, task = config.task.split('_', 1)
-# reward = bool(['noreward', 'reward'].index(task))
-# env = common.Crafter(config.logdir, reward)
-# env = common.OneHotAction(env)
 
 main(config)

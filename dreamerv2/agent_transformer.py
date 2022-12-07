@@ -125,10 +125,10 @@ class TransformerWorldModel(common.Module):
     embed = self.encoder(data) # embed: x_t
     post, prior = self.tssm.observe(embed, data['action'], data['is_first'])
     kl_loss, kl_value = self.tssm.kl_loss(post, prior, **self.config.kl)
-    transformer_loss = self.tssm.transformer_loss
+    # transformer_loss = self.tssm.transformer_loss
     assert len(kl_loss.shape) == 0
     likes = {}
-    losses = {'kl': kl_loss, 'transformer': transformer_loss}
+    losses = {'kl': kl_loss}#, 'transformer': transformer_loss}
     feat = self.tssm.get_feat(post) # z_t, h_t
     for name, head in self.heads.items():
       grad_head = (name in self.config.grad_heads)
@@ -205,8 +205,8 @@ class TransformerWorldModel(common.Module):
     decoder = self.heads['decoder']
     truth = data[key][:6] + 0.5
     embed = self.encoder(data) # x_t
-    states, _ = self.tssm.observe(
-        embed[:6, :5], data['action'][:6, :5], data['is_first'][:6, :5]) # get z_t, h_t
+    states, _ = self.tssm.obs_step(
+        data['action'][:6, :5], embed[:6, :5], data['is_first'][:6, :5]) # get z_t, h_t
     recon = decoder(self.tssm.get_feat(states))[key].mode()[:6] # get x_t\hat
     prior = self.tssm.imagine(data['action'][:6], states)
     openl = decoder(self.tssm.get_feat(prior))[key].mode()

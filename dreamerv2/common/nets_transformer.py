@@ -42,27 +42,11 @@ class EnsembleTSSM(common.Module):
 
   @tf.function
   def observe(self, embeds, actions, is_first):
-    '''
-    input:
-      embeds:       x_t
-      actions:      a_t
-      state.stoch:  z_t\hat
-      state.deter:  h_t\hat
-      state.logit:
-    output:
-      post.stoch:   z_t
-      post.deter:   h_t
-      prior.stoch:  z_t\hat
-      prior.deter:  h_t
-    '''
-    # if states is None:
-    #   batch_size, seq_len = tf.shape(actions)[:2]
-    #   states = self.initial(batch_size, seq_len)
     post, prior = self.obs_step(actions, embeds, is_first)
     return post, prior
 
   @tf.function
-  def imagine(self, actions, state=None):
+  def imagine(self, actions, states):
     '''
     input:
       actions:      a_t
@@ -71,14 +55,13 @@ class EnsembleTSSM(common.Module):
       prior.stoch:  z_t\hat
       prior.deter:  h_t
       '''
-    if state is None:
-      state = self.initial(tf.shape(actions)[0])
-    assert isinstance(state, dict), state
-    batch_size, seq_len, _ = actions.shape
-    while state['stoch'].shape[1]!=seq_len:
-      prior = self.img_step(state['stoch'], actions)
-      state['stoch'] = tf.concat([state['stoch'], tf.expand_dims(prior['stoch'][:,-1], 1)], 1)
-    return self.img_step(state['stoch'], actions)
+    seq_len, max_len = states['stoch'].shape[1], actions.shape[1]
+    indices = range(seq_len, max_len+1)
+    for index in indices:
+      indexed_actions = tf.nest.map_structure(lambda x: x[:,:index], actions)
+      pred = self.img_step(states['stoch'], indexed_actions)
+      states = {k: tf.concat([v, pred[k][:,None,-1]], axis=1) for k, v in states.items()}
+    return pred
 
   def get_feat(self, state):
     stoch = self._cast(state['stoch'])
@@ -101,14 +84,33 @@ class EnsembleTSSM(common.Module):
       dist = tfd.MultivariateNormalDiag(mean, std)
     return dist
 
+  def get_post_stochs(self, embeds, sample=True):
+    x = self.get('obs_out', tfkl.Dense, self._hidden)(embeds)
+    x = self.get('obs_out_norm', common.NormLayer, self._norm)(x)
+    x = self._act(x)
+
+    stats = self._suff_stats_layer('obs_dist', x)
+    dist = self.get_dist(stats)
+    stochs = dist.sample() if sample else dist.mode() # z_t | x_t
+    return stochs, stats
+    
+  def get_prior_stochs(self, deter, sample=True):
+    stats = self._suff_stats_ensemble(deter)
+    index = tf.random.uniform((), 0, self._ensemble, tf.int32)
+    stats = {k: v[index] for k, v in stats.items()}
+    dist = self.get_dist(stats)
+    stochs = dist.sample() if sample else dist.mode()
+    return stochs, stats
+
   @tf.function
   def obs_step(self, actions, embeds, is_first, sample=True):
     '''
     input:
       embeds:       x_t
       actions:      a_t
-    calculates:
-      stochs:       z_t
+      state.stoch:  z_t\hat
+      state.deter:  h_t\hat
+      state.logit:
     output:
       post.stoch:   z_t
       post.deter:   h_t
@@ -118,19 +120,12 @@ class EnsembleTSSM(common.Module):
     if len(is_first.shape)<2: 
         is_first=is_first.reshape([1,1])
         embeds=embeds.reshape([1,1,-1])
+    
     # Zero out firsts
     actions = tf.nest.map_structure(
         lambda x: tf.einsum('bl,bl...->bl...', 1.0 - is_first.astype(x.dtype), x), (actions))
-
-    x = self.get('obs_out', tfkl.Dense, self._hidden)(embeds)
-    x = self.get('obs_out_norm', common.NormLayer, self._norm)(x)
-    stochs = self._act(x)  # z_t | x_t
-
-    prior = self.img_step(stochs, actions, sample) # (z_t\hat | h_t), (h_t | z_t, a_t)
-
-    stats = self._suff_stats_layer('obs_dist', x)
-    dist = self.get_dist(stats)
-    stochs = dist.sample() if sample else dist.mode()
+    stochs, stats = self.get_post_stochs(embeds, sample) # z_t | x_t
+    prior = self.img_step(stochs, actions, sample) # prior: (z_t\hat | h_t), (h_t | z_t, a_t)
     post = {'stoch': stochs, 'deter': prior['deter'], **stats} # (z_t | x_t), (h_t | z_t, a_t)
     return post, prior
 
@@ -149,40 +144,16 @@ class EnsembleTSSM(common.Module):
     if self._discrete and stochs.shape[-1]!=self._stoch * self._discrete:
       shape = stochs.shape[:-2] + [self._stoch * self._discrete]
       stochs = tf.reshape(stochs, shape)
-    batch_size, seq_len, _ = stochs.shape
 
-    # with tf.GradientTape() as transformer_tape:
-    x = tf.concat([stochs, actions[:,:seq_len]], -1) # z_t, a_t
-    x = self.get('img_out', tfkl.Dense, self._hidden)(x)
+    x = tf.concat([stochs, actions], -1) # z_t, a_t
+    x = self.get('img_in', tfkl.Dense, self._hidden)(x)
     x = self.get('img_in_norm', common.NormLayer, self._norm)(x)
-    token_embeds = self._act(x)
-    # tokens = self.get('img_softargmax', common.Softargmax)(x)
+    input_embeds = self._act(x)
 
-    token_embeds = tf.concat([tf.zeros(shape=(batch_size, 1, self._hidden)), token_embeds], axis=1)
-    # token_embeds = tf.keras.preprocessing.sequence.pad_sequences(token_embeds, maxlen=seq_len+1, padding='pre', dtype='float32')
-
-    # with tf.device('cpu:0'):
-    #   embedding_layer = self.get('in_embedding', tfkl.Embedding, input_dim=4096, output_dim=self._hidden, mask_zero=True)
-    #   embedding_layer.build(input_shape=4096)
-    # token_embeds = embedding_layer(tokens)
-    input_embeds, target_embeds = token_embeds[:,:-1], token_embeds[:,1:]
-
-    transformer = self.get('img_transformer', common.Transformer, num_layers=1, d_model=self._hidden, 
-                            num_heads=1, dff=512, vocab_size=self._hidden, dropout_rate=0.1)
-
-    deter = transformer((input_embeds, target_embeds),) # h_t | z_t, a_t
-    loss_fn = tf.losses.CosineSimilarity(axis=-1)
-    self.transformer_loss = loss_fn(target_embeds, deter)
-      # print(f'{"Transformer loss:":25s} {transformer_loss.numpy()}')
-    # self.transformer_opt(transformer_tape, self.transformer_loss, transformer)
-    # pred_tokens = self.get('img_softargmax', common.Softargmax)(preds)
-    # deter = self.get('in_embedding', tfkl.Embedding, input_dim=4096, output_dim=self._hidden, mask_zero=True)(pred_tokens)
-
-    stats = self._suff_stats_ensemble(deter)
-    index = tf.random.uniform((), 0, self._ensemble, tf.int32)
-    stats = {k: v[index] for k, v in stats.items()}
-    dist = self.get_dist(stats)
-    stochs = dist.sample() if sample else dist.mode()
+    transformer_encoder = self.get('img_transformer', common.AttentionEncoder, num_layers=1, d_model=self._hidden, num_heads=1, dff=512, dropout_rate=0.1)
+    deter = transformer_encoder(input_embeds)
+    stochs, stats = self.get_prior_stochs(deter, sample=sample)
+    
     prior = {'stoch': stochs, 'deter': deter, **stats}
     return prior
 

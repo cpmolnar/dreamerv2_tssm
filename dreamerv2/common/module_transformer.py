@@ -84,7 +84,7 @@ class EncoderLayer(tfkl.Layer):
   def __init__(self,*, d_model, num_heads, dff, dropout_rate=0.1):
     super().__init__()
 
-    self.self_attention = GlobalSelfAttention(
+    self.self_attention = CausalSelfAttention(
         num_heads=num_heads,
         key_dim=d_model,
         dropout=dropout_rate)
