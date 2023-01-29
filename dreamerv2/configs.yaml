@@ -2,7 +2,7 @@ defaults:
 
   # Train Script
   logdir: /dev/null
-  seed: 0
+  seed: 1234
   task: gym_minigrid
   envs: 1
   envs_parallel: none
@@ -28,6 +28,7 @@ defaults:
   log_keys_max: '^$'
   precision: 16
   jit: True
+  load_model: True
 
   # Agent
   clip_rewards: tanh
@@ -45,7 +46,7 @@ defaults:
   decoder: {mlp_keys: '.*', cnn_keys: '.*', act: elu, norm: none, cnn_depth: 48, cnn_kernels: [5, 5, 6, 6], mlp_layers: [400, 400, 400, 400]}
   reward_head: {layers: 4, units: 400, act: elu, norm: none, dist: mse}
   discount_head: {layers: 4, units: 400, act: elu, norm: none, dist: binary}
-  loss_scales: {kl: 1.0, reward: 1.0, discount: 1.0, proprio: 1.0}
+  loss_scales: {kl: 1.0, reward: 1.0, discount: 1.0, proprio: 1.0, transformer: 1.0}
   kl: {free: 0.0, forward: False, balance: 0.8, free_avg: True}
   model_opt: {opt: adam, lr: 1e-4, eps: 1e-5, clip: 100, wd: 1e-6}
 
@@ -78,6 +79,9 @@ defaults:
   disag_offset: 1
   disag_action_cond: True
   expl_model_loss: kl
+
+  # Episodic Memory
+  episodic_memory: {max_size: 1024}
 
 atari:
 

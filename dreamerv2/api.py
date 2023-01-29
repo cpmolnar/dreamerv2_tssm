@@ -5,6 +5,7 @@ import pathlib
 import re
 import sys
 import warnings
+import shutil
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 logging.getLogger().setLevel('ERROR')
@@ -34,6 +35,7 @@ defaults = common.Config(configs.pop('defaults'))
 
 def train(env, config, outputs=None):
   logdir = pathlib.Path(config.logdir).expanduser()
+  if logdir.exists() and not config.load_model: shutil.rmtree(logdir)
   logdir.mkdir(parents=True, exist_ok=True)
   config.save(logdir / 'config.yaml')
   print(config, '\n')
@@ -95,9 +97,9 @@ def train(env, config, outputs=None):
     driver.reset()
 
   print('Create agent.')
-  assert config.ssm_type in ['rnn', 'transformer'], 'ssm_type must be one of ["rnn", "transformer"].'
-  if config.ssm_type=='rnn': agnt = agent.Agent(config, env.obs_space, env.act_space, step)
-  elif config.ssm_type=='transformer': agnt = agent_transformer.Agent(config, env.obs_space, env.act_space, step)
+  assert config.ssm_type in ['rssm', 'tssm'], 'ssm_type must be one of ["rnn", "transformer"].'
+  if config.ssm_type=='rssm': agnt = agent.Agent(config, env.obs_space, env.act_space, step)
+  elif config.ssm_type=='tssm': agnt = agent_transformer.Agent(config, env.obs_space, env.act_space, step)
   dataset = iter(replay.dataset(**config.dataset))
   train_agent = common.CarryOverState(agnt.train)
   train_agent(next(dataset))
