@@ -20,10 +20,10 @@ warnings.filterwarnings('ignore', '.*box bound precision lowered.*')
 sys.path.append(str(pathlib.Path(__file__).parent))
 sys.path.append(str(pathlib.Path(__file__).parent.parent))
 
-import numpy as np
+import numpy as np, torch
 import ruamel.yaml as yaml
 
-import agent, agent_transformer
+import agent, agent_transformer, agent_transformer_em
 import common
 
 
@@ -38,6 +38,7 @@ def main(config):
   # config = common.Flags(config).parse(remaining)
 
   logdir = pathlib.Path(config.logdir).expanduser()
+  if logdir.exists() and not config.load_model: import shutil; shutil.rmtree(logdir)
   logdir.mkdir(parents=True, exist_ok=True)
   config.save(logdir / 'config.yaml')
   print(config, '\n')
@@ -53,6 +54,10 @@ def main(config):
   # if config.precision == 16:
   #   from tensorflow.keras.mixed_precision import experimental as prec
   #   prec.set_policy(prec.Policy('mixed_float16'))
+  np.random.seed(config.seed)
+  torch.manual_seed(config.seed)
+  tf.random.set_seed(config.seed)
+  tf.keras.utils.set_random_seed(config.seed)
 
   train_replay = common.Replay(logdir / 'train_episodes', **config.replay)
   eval_replay = common.Replay(logdir / 'eval_episodes', **dict(
@@ -92,7 +97,17 @@ def main(config):
       env = common.Crafter(outdir, reward)
       env = common.OneHotAction(env)
     elif suite == 'gym':
-      outdir = logdir / 'gym' if mode == 'train' else None
+      # outdir = logdir / 'gym' if mode == 'train' else None
+      import gymnasium as gym
+      import minigrid
+      env = gym.make("MiniGrid-DoorKey-6x6-v0")
+      env = minigrid.wrappers.RGBImgPartialObsWrapper(env)
+      env = common.GymWrapper(env)
+      env = common.ResizeImage(env)
+      if hasattr(env.act_space['action'], 'n'):
+        env = common.OneHotAction(env)
+      else:
+        env = common.NormalizeAction(env)
     else:
       raise NotImplementedError(suite)
     env = common.TimeLimit(env, config.time_limit)
@@ -131,12 +146,12 @@ def main(config):
     eval_envs = [make_async_env('eval') for _ in range(eval_envs)]
   act_space = train_envs[0].act_space
   obs_space = train_envs[0].obs_space
-  train_driver = common.Driver(train_envs)
+  train_driver = common.Driver(train_envs)# if 'rssm' in config.ssm_type else common.SequentialDriver(train_envs)
   train_driver.on_episode(lambda ep: per_episode(ep, mode='train'))
   train_driver.on_step(lambda tran, worker: step.increment())
   train_driver.on_step(train_replay.add_step)
   train_driver.on_reset(train_replay.add_step)
-  eval_driver = common.Driver(eval_envs)
+  eval_driver = common.Driver(eval_envs)# if 'rssm' in config.ssm_type else common.SequentialDriver(train_envs)
   eval_driver.on_episode(lambda ep: per_episode(ep, mode='eval'))
   eval_driver.on_episode(eval_replay.add_episode)
 
@@ -153,9 +168,9 @@ def main(config):
   train_dataset = iter(train_replay.dataset(**config.dataset))
   report_dataset = iter(train_replay.dataset(**config.dataset))
   eval_dataset = iter(eval_replay.dataset(**config.dataset))
-  assert config.ssm_type in ['rssm', 'tssm'], 'invalid ssm_type'
   if config.ssm_type=='rssm': agnt = agent.Agent(config, obs_space, act_space, step)
   elif config.ssm_type=='tssm': agnt = agent_transformer.Agent(config, obs_space, act_space, step)
+  elif config.ssm_type=='tssm_em': agnt = agent_transformer_em.Agent(config, obs_space, act_space, step)
   train_agent = common.CarryOverState(agnt.train)
   train_agent(next(train_dataset))
   if (logdir / 'variables.pkl').exists():

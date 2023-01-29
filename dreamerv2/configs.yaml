@@ -2,7 +2,7 @@ defaults:
 
   # Train Script
   logdir: /dev/null
-  seed: 0
+  seed: 1234
   task: gym_minigrid
   envs: 1
   envs_parallel: none
@@ -28,6 +28,7 @@ defaults:
   log_keys_max: '^$'
   precision: 16
   jit: True
+  load_model: True
 
   # Agent
   clip_rewards: tanh
@@ -78,6 +79,9 @@ defaults:
   disag_offset: 1
   disag_action_cond: True
   expl_model_loss: kl
+
+  # Episodic Memory
+  episodic_memory: {max_size: 1024}
 
 atari:
 

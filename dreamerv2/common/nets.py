@@ -93,14 +93,14 @@ class EnsembleRSSM(common.Module):
         lambda x: tf.einsum(
             'b,b...->b...', 1.0 - is_first.astype(x.dtype), x),
         (prev_state, prev_action))
-    prior = self.img_step(prev_state, prev_action, sample)
-    x = tf.concat([prior['deter'], embed], -1)
-    x = self.get('obs_out', tfkl.Dense, self._hidden)(x)
+    x = self.get('obs_out', tfkl.Dense, self._hidden)(embed)
     x = self.get('obs_out_norm', NormLayer, self._norm)(x)
     x = self._act(x)
     stats = self._suff_stats_layer('obs_dist', x)
     dist = self.get_dist(stats)
     stoch = dist.sample() if sample else dist.mode()
+    
+    prior = self.img_step(prev_state, prev_action, sample)
     post = {'stoch': stoch, 'deter': prior['deter'], **stats}
     return post, prior
 

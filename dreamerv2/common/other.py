@@ -24,7 +24,7 @@ class RandomAgent:
       self._dist = tfd.Independent(dist, 1)
 
   def __call__(self, obs, state=None, mode=None):
-    action = self._dist.sample(len(obs['is_first']))
+    action = self._dist.sample(1)
     output = {'action': action}
     if self.logprob:
       output['logprob'] = self._dist.log_prob(action)
@@ -199,5 +199,5 @@ class CarryOverState:
     self._state = None
 
   def __call__(self, *args):
-    self._state, out = self._fn(*args, self._state)
+    self._state, out = self._fn(*args, self._state, update_mem=True)
     return out

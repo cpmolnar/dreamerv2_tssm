@@ -14,6 +14,7 @@ class Agent(common.Module):
     self.step = step
     self.tfstep = tf.Variable(int(self.step), tf.int64)
     self.wm = WorldModel(config, obs_space, self.tfstep)
+    self.em = common.EpisodicMemory(config.dataset['length'], config.rssm['hidden'] + (config.rssm['stoch'] * config.rssm['discrete']), 2*act_space['action'].shape[0], **config.episodic_memory)
     self._task_behavior = ActorCritic(config, self.act_space, self.tfstep)
     if config.expl_behavior == 'greedy':
       self._expl_behavior = self._task_behavior
@@ -24,30 +25,32 @@ class Agent(common.Module):
 
   @tf.function
   def policy(self, obs, state=None, mode='train'):
+    expand_dims = lambda x: tf.expand_dims(x, 1)
     obs = tf.nest.map_structure(tf.tensor, obs)
     tf.py_function(lambda: self.tfstep.assign(
         int(self.step), read_value=False), [], [])
     if state is None:
-      latent = self.wm.rssm.initial(len(obs['reward']))
+      latent = self.wm.tssm.initial(len(obs['reward']))
       action = tf.zeros((len(obs['reward']),) + self.act_space.shape)
       state = latent, action
     latent, action = state
     embed = self.wm.encoder(self.wm.preprocess(obs))
     sample = (mode == 'train') or not self.config.eval_state_mean
-    latent, _ = self.wm.rssm.obs_step(
-        latent, action, embed, obs['is_first'], sample)
-    feat = self.wm.rssm.get_feat(latent)
+    latent, _ = self.wm.tssm.obs_step(
+        expand_dims(action), expand_dims(embed), expand_dims(obs['is_first']), sample)
+    latent = {k: v[:, 0] for k, v in latent.items()}
+    feat = self.wm.tssm.get_feat(latent)
     if mode == 'eval':
-      actor = self._task_behavior.actor(feat)
-      action = actor.mode()
+      actor = self._task_behavior.actor(expand_dims(feat), self.em)
+      action = actor.mode()[0]
       noise = self.config.eval_noise
     elif mode == 'explore':
-      actor = self._expl_behavior.actor(feat)
-      action = actor.sample()
+      actor = self._expl_behavior.actor(expand_dims(feat), self.em)
+      action = actor.sample()[0]
       noise = self.config.expl_noise
     elif mode == 'train':
-      actor = self._task_behavior.actor(feat)
-      action = actor.sample()
+      actor = self._task_behavior.actor(expand_dims(feat), self.em)
+      action = actor.sample()[0]
       noise = self.config.expl_noise
     action = common.action_noise(action, noise, self.act_space)
     outputs = {'action': action}
@@ -55,14 +58,19 @@ class Agent(common.Module):
     return outputs, state
 
   @tf.function
-  def train(self, data, state=None, update_mem=None):
+  def train(self, data, state=None, update_mem=False):
     metrics = {}
     state, outputs, mets = self.wm.train(data, state)
     metrics.update(mets)
     start = outputs['post']
     reward = lambda seq: self.wm.heads['reward'](seq['feat']).mode()
+    if update_mem:
+      keys = self.wm.tssm.get_feat(start)
+      values = tf.concat((data['action'], tf.einsum('bla, bl -> bla', data['action'], data['reward'])), -1)
+      self.em.cleanup()
+      self.em.add_seqs(keys, values)
     metrics.update(self._task_behavior.train(
-        self.wm, start, data['is_terminal'], reward))
+        self.wm, self.em, start, data['is_terminal'], reward))
     if self.config.expl_behavior != 'greedy':
       mets = self._expl_behavior.train(start, outputs, data)[-1]
       metrics.update({'expl_' + key: value for key, value in mets.items()})
@@ -84,7 +92,7 @@ class WorldModel(common.Module):
     shapes = {k: tuple(v.shape) for k, v in obs_space.items() if v.shape is not None}
     self.config = config
     self.tfstep = tfstep
-    self.rssm = common.EnsembleRSSM(**config.rssm)
+    self.tssm = common.EnsembleTSSM(**config.rssm)
     self.encoder = common.Encoder(shapes, **config.encoder)
     self.heads = {}
     self.heads['decoder'] = common.Decoder(shapes, **config.decoder)
@@ -98,20 +106,19 @@ class WorldModel(common.Module):
   def train(self, data, state=None):
     with tf.GradientTape() as model_tape:
       model_loss, state, outputs, metrics = self.loss(data, state)
-    modules = [self.encoder, self.rssm, *self.heads.values()]
+    modules = [self.encoder, self.tssm, *self.heads.values()]
     metrics.update(self.model_opt(model_tape, model_loss, modules))
     return state, outputs, metrics
 
   def loss(self, data, state=None):
     data = self.preprocess(data)
     embed = self.encoder(data) # z_t
-    post, prior = self.rssm.observe(
-        embed, data['action'], data['is_first'], state) # out: z_t\hat, z_t. in: z_t, a_t
-    kl_loss, kl_value = self.rssm.kl_loss(post, prior, **self.config.kl)
+    post, prior = self.tssm.observe(embed, data['action'], data['is_first'], state) # out: z_t\hat, z_t. in: z_t, a_t
+    kl_loss, kl_value = self.tssm.kl_loss(post, prior, **self.config.kl)
     assert len(kl_loss.shape) == 0
     likes = {}
     losses = {'kl': kl_loss}
-    feat = self.rssm.get_feat(post) # z_t\hat, h_t
+    feat = self.tssm.get_feat(post) # z_t\hat, h_t
     for name, head in self.heads.items():
       grad_head = (name in self.config.grad_heads)
       inp = feat if grad_head else tf.stop_gradient(feat)
@@ -128,21 +135,21 @@ class WorldModel(common.Module):
         prior=prior, likes=likes, kl=kl_value)
     metrics = {f'{name}_loss': value for name, value in losses.items()}
     metrics['model_kl'] = kl_value.mean()
-    metrics['prior_ent'] = self.rssm.get_dist(prior).entropy().mean()
-    metrics['post_ent'] = self.rssm.get_dist(post).entropy().mean()
+    metrics['prior_ent'] = self.tssm.get_dist(prior).entropy().mean()
+    metrics['post_ent'] = self.tssm.get_dist(post).entropy().mean()
     last_state = {k: v[:, -1] for k, v in post.items()}
     return model_loss, last_state, outs, metrics
 
-  def imagine(self, policy, start, is_terminal, horizon):
-    flatten = lambda x: x.reshape([-1] + list(x.shape[2:]))
-    start = {k: flatten(v) for k, v in start.items()}
-    start['feat'] = self.rssm.get_feat(start)
-    start['action'] = tf.zeros_like(policy(start['feat']).mode())
+  def imagine(self, policy, em, start, is_terminal, horizon):
+    # flatten = lambda x: x.reshape([-1] + list(x.shape[2:]))
+    # start = {k: flatten(v) for k, v in start.items()}
+    start['feat'] = self.tssm.get_feat(start)
+    start['action'] = tf.zeros_like(policy(start['feat'], em).mode())
     seq = {k: [v] for k, v in start.items()}
     for _ in range(horizon):
-      action = policy(tf.stop_gradient(seq['feat'][-1])).sample()
-      state = self.rssm.img_step({k: v[-1] for k, v in seq.items()}, action)
-      feat = self.rssm.get_feat(state)
+      action = policy(tf.stop_gradient(seq['feat'][-1]), em).sample()
+      state = self.tssm.img_step(action, seq['stoch'][-1])
+      feat = self.tssm.get_feat(state)
       for key, value in {**state, 'action': action, 'feat': feat}.items():
         seq[key].append(value)
     seq = {k: tf.stack(v, 0) for k, v in seq.items()}
@@ -151,7 +158,7 @@ class WorldModel(common.Module):
       if is_terminal is not None:
         # Override discount prediction for the first step with the true
         # discount factor from the replay buffer.
-        true_first = 1.0 - flatten(is_terminal).astype(disc.dtype)
+        true_first = 1.0 - is_terminal.astype(disc.dtype)
         true_first *= self.config.discount
         disc = tf.concat([true_first[None], disc[1:]], 0)
     else:
@@ -189,13 +196,12 @@ class WorldModel(common.Module):
     decoder = self.heads['decoder']
     truth = data[key][:6] + 0.5
     embed = self.encoder(data) # x_t
-    states, _ = self.rssm.observe(
+    states, _ = self.tssm.observe(
         embed[:6, :5], data['action'][:6, :5], data['is_first'][:6, :5]) # get z_t, h_t
-    recon = decoder(self.rssm.get_feat(states))[key].mode()[:6] # get x_t\hat
-    init = {k: v[:, -1] for k, v in states.items()}
-    prior = self.rssm.imagine(data['action'][:6, 5:], init)
-    openl = decoder(self.rssm.get_feat(prior))[key].mode()
-    model = tf.concat([recon[:, :5] + 0.5, openl + 0.5], 1)
+    recon = decoder(self.tssm.get_feat(states))[key].mode()[:6] # get x_t\hat
+    prior = self.tssm.imagine(data['action'][:6], states)
+    openl = decoder(self.tssm.get_feat(prior))[key].mode()
+    model = tf.concat([recon[:, :5] + 0.5, openl[:, 5:] + 0.5], 1)
     error = (model - truth + 1) / 2
     video = tf.concat([truth, model, error], 2)
     B, T, H, W, C = video.shape
@@ -215,7 +221,7 @@ class ActorCritic(common.Module):
     if self.config.actor_grad == 'auto':
       self.config = self.config.update({
           'actor_grad': 'reinforce' if discrete else 'dynamics'})
-    self.actor = common.MLP(act_space.shape[0], **self.config.actor)
+    self.actor = common.PolicyMLP(act_space.shape[0], **self.config.actor)
     self.critic = common.MLP([], **self.config.critic)
     if self.config.slow_target:
       self._target_critic = common.MLP([], **self.config.critic)
@@ -226,7 +232,7 @@ class ActorCritic(common.Module):
     self.critic_opt = common.Optimizer('critic', **self.config.critic_opt)
     self.rewnorm = common.StreamNorm(**self.config.reward_norm)
 
-  def train(self, world_model, start, is_terminal, reward_fn):
+  def train(self, wm, em, start, is_terminal, reward_fn):
     metrics = {}
     hor = self.config.imag_horizon
     # The weights are is_terminal flags for the imagination start states.
@@ -235,12 +241,12 @@ class ActorCritic(common.Module):
     # training the action that led into the first step anyway, so we can use
     # them to scale the whole sequence.
     with tf.GradientTape() as actor_tape:
-      seq = world_model.imagine(self.actor, start, is_terminal, hor)
+      seq = wm.imagine(self.actor, em, start, is_terminal, hor)
       reward = reward_fn(seq)
       seq['reward'], mets1 = self.rewnorm(reward)
       mets1 = {f'reward_{k}': v for k, v in mets1.items()}
       target, mets2 = self.target(seq)
-      actor_loss, mets3 = self.actor_loss(seq, target)
+      actor_loss, mets3 = self.actor_loss(seq, target, em)
     with tf.GradientTape() as critic_tape:
       critic_loss, mets4 = self.critic_loss(seq, target)
     metrics.update(self.actor_opt(actor_tape, actor_loss, self.actor))
@@ -249,7 +255,7 @@ class ActorCritic(common.Module):
     self.update_slow_target()  # Variables exist after first forward pass.
     return metrics
 
-  def actor_loss(self, seq, target):
+  def actor_loss(self, seq, target, em):
     # Actions:      0   [a1]  [a2]   a3
     #                  ^  |  ^  |  ^  |
     #                 /   v /   v /   v

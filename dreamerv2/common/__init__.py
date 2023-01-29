@@ -17,3 +17,4 @@ from .dists import *
 from .nets import *
 from .nets_transformer import *
 from .module_transformer import *
+from .module_episodic_memory import *

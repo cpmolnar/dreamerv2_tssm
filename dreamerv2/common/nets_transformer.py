@@ -5,9 +5,12 @@ import tensorflow as tf
 from tensorflow.keras import layers as tfkl
 from tensorflow_probability import distributions as tfd
 from tensorflow.keras import mixed_precision as prec
+
 import common
 
+
 class EnsembleTSSM(common.Module):
+
   def __init__(
       self, ensemble=5, stoch=30, deter=200, hidden=200, discrete=False,
       act='elu', norm='none', std_act='softplus', min_std=0.1):
@@ -21,54 +24,44 @@ class EnsembleTSSM(common.Module):
     self._norm = norm
     self._std_act = std_act
     self._min_std = min_std
+    self._cell = common.GRUCell(self._deter, norm=True)
     self._cast = lambda x: tf.cast(x, prec.global_policy().compute_dtype)
-    self.transformer_loss = None
-    self.transformer_opt = common.Optimizer('transformer', **{'opt': 'adam', 'lr': 8e-5, 'eps': 1e-5, 'clip': 100, 'wd': 1e-6})
 
   def initial(self, batch_size, seq_len=1):
     dtype = prec.global_policy().compute_dtype
     if self._discrete:
       state = dict(
-          logit=tf.zeros([batch_size, seq_len, self._stoch, self._discrete], dtype),
-          stoch=tf.zeros([batch_size, seq_len, self._stoch, self._discrete], dtype),
-          deter=tf.zeros([batch_size, seq_len, self._deter], dtype))
+          logit=tf.zeros([batch_size, self._stoch, self._discrete], dtype),
+          stoch=tf.zeros([batch_size, self._stoch, self._discrete], dtype),
+          deter=self._cell.get_initial_state(None, batch_size, dtype))
     else:
       state = dict(
-          mean=tf.zeros([batch_size, seq_len, self._stoch], dtype),
-          std=tf.zeros([batch_size, seq_len, self._stoch], dtype),
-          stoch=tf.zeros([batch_size, seq_len, self._stoch], dtype),
-          deter=tf.zeros([batch_size, seq_len, self._deter], dtype))
+          mean=tf.zeros([batch_size, self._stoch], dtype),
+          std=tf.zeros([batch_size, self._stoch], dtype),
+          stoch=tf.zeros([batch_size, self._stoch], dtype),
+          deter=self._cell.get_initial_state(None, batch_size, dtype))
     return state
 
   @tf.function
-  def observe(self, embeds, actions, is_first):
-    post, prior = self.obs_step(actions, embeds, is_first)
+  def observe(self, embed, action, is_first, state=None):
+    if state is None:
+      state = self.initial(tf.shape(action)[0])
+    post, prior = self.obs_step(action, embed, is_first)
     return post, prior
 
   @tf.function
   def imagine(self, actions, states):
-    '''
-    input:
-      actions:      a_t
-      state.stoch:  z_t
-    output:
-      prior.stoch:  z_t\hat
-      prior.deter:  h_t
-      '''
-    seq_len, max_len = states['stoch'].shape[1], actions.shape[1]
-    indices = range(seq_len, max_len+1)
-    for index in indices:
-      indexed_actions = tf.nest.map_structure(lambda x: x[:,:index], actions)
-      pred = self.img_step(states['stoch'], indexed_actions)
-      states = {k: tf.concat([v, pred[k][:,None,-1]], axis=1) for k, v in states.items()}
-    return pred
+    for i in range(states['stoch'].shape[1], actions.shape[1]):
+      prior = self.img_step(actions[:,:i], states['stoch'])
+      states = {k: tf.concat([v, prior[k][:,None,-1]], axis=1) for k, v in states.items()}
+    return states
 
   def get_feat(self, state):
-    stoch = self._cast(state['stoch'])
+    stoch = self._cast(state['stoch']) # z_t\hat
     if self._discrete:
       shape = stoch.shape[:-2] + [self._stoch * self._discrete]
       stoch = tf.reshape(stoch, shape)
-    return tf.concat([stoch, state['deter']], -1)
+    return tf.concat([stoch, state['deter']], -1) # z_t\hat, h_t
 
   def get_dist(self, state, ensemble=False):
     if ensemble:
@@ -91,9 +84,12 @@ class EnsembleTSSM(common.Module):
 
     stats = self._suff_stats_layer('obs_dist', x)
     dist = self.get_dist(stats)
-    stochs = dist.sample() if sample else dist.mode() # z_t | x_t
+    if sample=='both':
+      return dist.sample(), dist.mode(), stats
+    else: 
+      stochs = dist.sample() if sample else dist.mode() # z_t | x_t
     return stochs, stats
-    
+
   def get_prior_stochs(self, deter, sample=True):
     stats = self._suff_stats_ensemble(deter)
     index = tf.random.uniform((), 0, self._ensemble, tf.int32)
@@ -104,60 +100,35 @@ class EnsembleTSSM(common.Module):
 
   @tf.function
   def obs_step(self, actions, embeds, is_first, sample=True):
-    '''
-    input:
-      embeds:       x_t
-      actions:      a_t
-      state.stoch:  z_t\hat
-      state.deter:  h_t\hat
-      state.logit:
-    output:
-      post.stoch:   z_t
-      post.deter:   h_t
-      prior.stoch:  z_t\hat
-      prior.deter:  h_t
-    '''
-    if len(is_first.shape)<2: 
-        is_first=is_first.reshape([1,1])
-        embeds=embeds.reshape([1,1,-1])
-    
-    # Zero out firsts
+    # if is_first.any():
     actions = tf.nest.map_structure(
         lambda x: tf.einsum('bl,bl...->bl...', 1.0 - is_first.astype(x.dtype), x), (actions))
-    stochs, stats = self.get_post_stochs(embeds, sample) # z_t | x_t
-    prior = self.img_step(stochs, actions, sample) # prior: (z_t\hat | h_t), (h_t | z_t, a_t)
+    stochs, stochs_mode, stats = self.get_post_stochs(embeds, sample='both') # posterior: (z_t | x_t)
+    prior = self.img_step(actions, tf.concat((tf.zeros_like(stochs[:,None,0]), stochs[:,:-1]), 1), sample) # prior: (z_t\hat | h_t), (h_t | z_t, a_t)
     post = {'stoch': stochs, 'deter': prior['deter'], **stats} # (z_t | x_t), (h_t | z_t, a_t)
     return post, prior
 
   @tf.function
-  def img_step(self, stochs, actions, sample=True):
-    '''
-    input:
-      stochs:         z_t
-      actions:        a_t 
-    output:
-      prior.stochs:   z_t\hat
-      prior.deter:    h_t
-    '''
-    stochs = self._cast(stochs)
-    actions = self._cast(actions)
-    if self._discrete and stochs.shape[-1]!=self._stoch * self._discrete:
+  def img_step(self, actions, stochs, sample=True):
+    if self._discrete:
       shape = stochs.shape[:-2] + [self._stoch * self._discrete]
       stochs = tf.reshape(stochs, shape)
 
     x = tf.concat([stochs, actions], -1) # z_t, a_t
     x = self.get('img_in', tfkl.Dense, self._hidden)(x)
     x = self.get('img_in_norm', common.NormLayer, self._norm)(x)
-    input_embeds = self._act(x)
+    x = self._act(x)
 
     transformer_encoder = self.get('img_transformer', common.AttentionEncoder, num_layers=1, d_model=self._hidden, num_heads=1, dff=512, dropout_rate=0.1)
-    deter = transformer_encoder(input_embeds)
-    stochs, stats = self.get_prior_stochs(deter, sample=sample)
-    
-    prior = {'stoch': stochs, 'deter': deter, **stats}
+    deters = transformer_encoder(x)
+    stochs, stats = self.get_prior_stochs(deters, sample=sample)
+    prior = {'stoch': stochs, 'deter': deters, **stats}
+
     return prior
 
   def _suff_stats_ensemble(self, inp):
+    bs = list(inp.shape[:-1])
+    inp = inp.reshape([-1, inp.shape[-1]])
     stats = []
     for k in range(self._ensemble):
       x = self.get(f'img_out_{k}', tfkl.Dense, self._hidden)(inp)
@@ -168,7 +139,7 @@ class EnsembleTSSM(common.Module):
         k: tf.stack([x[k] for x in stats], 0)
         for k, v in stats[0].items()}
     stats = {
-        k: v.reshape([v.shape[0]] + [len(inp)] + list(v.shape[2:]))
+        k: v.reshape([v.shape[0]] + bs + list(v.shape[2:]))
         for k, v in stats.items()}
     return stats
 
@@ -207,3 +178,30 @@ class EnsembleTSSM(common.Module):
         loss_rhs = tf.maximum(value_rhs, free).mean()
       loss = mix * loss_lhs + (1 - mix) * loss_rhs
     return loss, value
+
+class PolicyMLP(common.Module):
+
+  def __init__(self, shape, layers, units, act='elu', norm='none', **out):
+    self._shape = (shape,) if isinstance(shape, int) else shape
+    self._layers = layers
+    self._units = units
+    self._norm = norm
+    self._act = common.nets.get_act(act)
+    self._out = out
+
+  def __call__(self, features, em=None):
+    if em is not None:
+      mem_seq = em.retrieve_seqs(features)[0]
+      features = tf.concat((tf.stop_gradient(features), mem_seq), -1)
+    else:
+      features = tf.concat((tf.stop_gradient(features), tf.zeros_like(features)), -1)
+
+    x = tf.cast(features, prec.global_policy().compute_dtype)
+    x = x.reshape([-1, x.shape[-1]])
+    for index in range(self._layers):
+      x = self.get(f'dense{index}', tfkl.Dense, self._units)(x)
+      x = self.get(f'norm{index}', common.nets.NormLayer, self._norm)(x)
+      x = self._act(x)
+    x = x.reshape(features.shape[:-1] + [x.shape[-1]])
+    return self.get('out', common.nets.DistLayer, self._shape, **self._out)(x)
+
