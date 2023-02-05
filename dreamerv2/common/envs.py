@@ -74,7 +74,7 @@ class GymWrapper:
 class DMC:
 
   def __init__(self, name, action_repeat=1, size=(64, 64), camera=None):
-    os.environ['MUJOCO_GL'] = 'egl'
+    # os.environ['MUJOCO_GL'] = 'egl'
     domain, task = name.split('_', 1)
     if domain == 'cup':  # Only domain with multiple words.
       domain = 'ball_in_cup'
