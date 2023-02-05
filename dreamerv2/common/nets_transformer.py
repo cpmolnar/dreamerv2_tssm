@@ -190,11 +190,10 @@ class PolicyMLP(common.Module):
     self._out = out
 
   def __call__(self, features, em=None):
-    if em is not None:
-      mem_seq = em.retrieve_seqs(features)[0]
-      features = tf.concat((tf.stop_gradient(features), mem_seq), -1)
-    else:
-      features = tf.concat((tf.stop_gradient(features), tf.zeros_like(features)), -1)
+    reshape = len(features.shape)==2
+    if reshape: features=features[None,:]
+    mem_seq = em.retrieve_seqs(features)[0]
+    features = tf.concat((tf.stop_gradient(features), mem_seq), -1)
 
     x = tf.cast(features, prec.global_policy().compute_dtype)
     x = x.reshape([-1, x.shape[-1]])
@@ -203,5 +202,5 @@ class PolicyMLP(common.Module):
       x = self.get(f'norm{index}', common.nets.NormLayer, self._norm)(x)
       x = self._act(x)
     x = x.reshape(features.shape[:-1] + [x.shape[-1]])
+    x = x[0] if reshape else x
     return self.get('out', common.nets.DistLayer, self._shape, **self._out)(x)
-

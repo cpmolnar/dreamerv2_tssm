@@ -81,7 +81,7 @@ defaults:
   expl_model_loss: kl
 
   # Episodic Memory
-  episodic_memory: {max_size: 1024}
+  episodic_memory: {max_size: 1024, verbose: False}
 
 atari:
 

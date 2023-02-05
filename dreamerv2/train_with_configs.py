@@ -23,7 +23,7 @@ sys.path.append(str(pathlib.Path(__file__).parent.parent))
 import numpy as np, torch
 import ruamel.yaml as yaml
 
-import agent, agent_transformer, agent_transformer_em
+import agent, agent_em, agent_transformer, agent_transformer_em
 import common
 
 
@@ -169,6 +169,7 @@ def main(config):
   report_dataset = iter(train_replay.dataset(**config.dataset))
   eval_dataset = iter(eval_replay.dataset(**config.dataset))
   if config.ssm_type=='rssm': agnt = agent.Agent(config, obs_space, act_space, step)
+  if config.ssm_type=='rssm_em': agnt = agent_em.Agent(config, obs_space, act_space, step)
   elif config.ssm_type=='tssm': agnt = agent_transformer.Agent(config, obs_space, act_space, step)
   elif config.ssm_type=='tssm_em': agnt = agent_transformer_em.Agent(config, obs_space, act_space, step)
   train_agent = common.CarryOverState(agnt.train)

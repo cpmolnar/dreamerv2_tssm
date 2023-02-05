@@ -9,7 +9,7 @@ from dreamerv2.train_with_configs import main
 
 logdir_path = r'C:\Users\Carl\OneDrive\Desktop'
 task = 'crafter_reward'
-ssm_type = 'rssm'
+ssm_type = 'rssm_em'
 exp_name = ''
 
 config = dv2.defaults.update({

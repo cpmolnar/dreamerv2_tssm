@@ -9,8 +9,8 @@ from dreamerv2.train_with_configs import main
 
 logdir_path = r'C:\Users\Carl\OneDrive\Desktop'
 task = 'dmc_walker_walk'
-ssm_type = 'tssm'
-exp_name = ''
+ssm_type = 'rssm_em'
+exp_name = '_exp'
 
 config = dv2.defaults.update({
     'task': task,
@@ -44,7 +44,8 @@ config = dv2.defaults.update({
     'actor_ent': 1e-4,
     'kl.free': 1.0,
 
-    'episodic_memory.max_size': 128,
+    'episodic_memory.max_size': 256,
+    'episodic_memory.verbose': False,
     'dataset.batch': 8, 
     'dataset.length': 50,
     'load_model': True
