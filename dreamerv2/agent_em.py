@@ -14,7 +14,8 @@ class Agent(common.Module):
     self.step = step
     self.tfstep = tf.Variable(int(self.step), tf.int64)
     self.wm = WorldModel(config, obs_space, self.tfstep)
-    self.em = common.EpisodicMemory(config.dataset['length'], config.rssm['hidden'] + (config.rssm['stoch'] * config.rssm['discrete']), 1+act_space['action'].shape[0], **config.episodic_memory)
+    d_k = d_v = config.rssm['hidden'] + (config.rssm['stoch'] * config.rssm['discrete'])
+    self.em = common.RaggedEpisodicMemory(config.dataset['length'], d_k, d_v, **config.episodic_memory)
     self._task_behavior = ActorCritic(config, self.act_space, self.tfstep)
     if config.expl_behavior == 'greedy':
       self._expl_behavior = self._task_behavior
@@ -37,20 +38,23 @@ class Agent(common.Module):
     sample = (mode == 'train') or not self.config.eval_state_mean
     latent, _ = self.wm.rssm.obs_step(
         latent, action, embed, obs['is_first'], sample)
-    feat = self.wm.rssm.get_feat(latent)
+    latent_exp = {k: tf.expand_dims(v, 0) for k, v in latent.items()}
+    feat = self.wm.rssm.get_feat(latent_exp)
+    skill = self.em.retrieve_skill(feat)
+    input = {**latent_exp, 'skill': skill, 'feat': feat}
     if mode == 'eval':
-      actor = self._task_behavior.actor(feat, self.em)
+      actor = self._task_behavior.actor(input)
       action = actor.mode()
       noise = self.config.eval_noise
     elif mode == 'explore':
-      actor = self._expl_behavior.actor(feat, self.em)
+      actor = self._expl_behavior.actor(input)
       action = actor.sample()
       noise = self.config.expl_noise
     elif mode == 'train':
-      actor = self._task_behavior.actor(feat, self.em)
+      actor = self._task_behavior.actor(input)
       action = actor.sample()
       noise = self.config.expl_noise
-    action = common.action_noise(action, noise, self.act_space)
+    action = common.action_noise(action, noise, self.act_space)[0]
     outputs = {'action': action}
     state = (latent, action)
     return outputs, state
@@ -64,7 +68,7 @@ class Agent(common.Module):
     reward = lambda seq: self.wm.heads['reward'](seq['feat']).mode()
     if update_mem:
       keys = self.wm.rssm.get_feat(start)
-      values = tf.concat((data['action'], tf.repeat(data['reward'][:,:,None,None].mean(axis=1), 50, 1)), -1)
+      values = data['reward'][:,:,None]
       self.em.cleanup()
       self.em.add_seqs(keys, values)
     metrics.update(self._task_behavior.train(
@@ -140,16 +144,22 @@ class WorldModel(common.Module):
     return model_loss, last_state, outs, metrics
 
   def imagine(self, policy, em, start, is_terminal, horizon):
-    flatten = lambda x: x.reshape([-1] + list(x.shape[2:]))
-    start = {k: flatten(v) for k, v in start.items()}
-    start['feat'] = self.rssm.get_feat(start)
-    start['action'] = tf.zeros_like(policy(start['feat'], em).mode())
+    # flatten = lambda x: x.reshape([-1] + list(x.shape[2:]))
+    sg = lambda x: tf.nest.map_structure(tf.stop_gradient, x)
+    # start = {k: flatten(v) for k, v in start.items()}
+    feat = self.rssm.get_feat(start)
+    skill = em.retrieve_skill(feat)
+    start['action'] = tf.zeros_like(policy({**start, 'skill': skill, 'feat': feat}).mode())
     seq = {k: [v] for k, v in start.items()}
+    seq['feat'] = [feat]
+    seq['skill'] = [skill]
     for _ in range(horizon):
-      action = policy(tf.stop_gradient(seq['feat'][-1]), em).sample()
+      input = {k: v[-1] for k, v in seq.items() if k in ['logit', 'stoch', 'deter', 'skill', 'feat']}
+      action = policy(sg(input)).sample()
       state = self.rssm.img_step({k: v[-1] for k, v in seq.items()}, action)
       feat = self.rssm.get_feat(state)
-      for key, value in {**state, 'action': action, 'feat': feat}.items():
+      skill = em.retrieve_skill(feat)
+      for key, value in {**state, 'action': action, 'skill': skill, 'feat': feat}.items():
         seq[key].append(value)
     seq = {k: tf.stack(v, 0) for k, v in seq.items()}
     if 'discount' in self.heads:
@@ -157,7 +167,7 @@ class WorldModel(common.Module):
       if is_terminal is not None:
         # Override discount prediction for the first step with the true
         # discount factor from the replay buffer.
-        true_first = 1.0 - flatten(is_terminal).astype(disc.dtype)
+        true_first = 1.0 - is_terminal.astype(disc.dtype)
         true_first *= self.config.discount
         disc = tf.concat([true_first[None], disc[1:]], 0)
     else:
@@ -221,7 +231,7 @@ class ActorCritic(common.Module):
     if self.config.actor_grad == 'auto':
       self.config = self.config.update({
           'actor_grad': 'reinforce' if discrete else 'dynamics'})
-    self.actor = common.PolicyMLP(act_space.shape[0], **self.config.actor)
+    self.actor = common.PolicyHierarchy(act_space.shape[0], **self.config.actor)
     self.critic = common.MLP([], **self.config.critic)
     if self.config.slow_target:
       self._target_critic = common.MLP([], **self.config.critic)
@@ -270,7 +280,12 @@ class ActorCritic(common.Module):
     # value prediction and one because the corresponding action does not lead
     # anywhere anymore. One target is lost at the start of the trajectory
     # because the initial state comes from the replay buffer.
-    policy = self.actor(tf.stop_gradient(seq['feat'][None, 0]), em)
+    sg = lambda x: tf.nest.map_structure(tf.stop_gradient, x)
+    flatten = lambda x: tf.squeeze(x.reshape([x.shape[0]] + [x.shape[1] * x.shape[2]] + [-1]))
+    target = flatten(target)
+    seq = {k: flatten(v) for k, v in seq.items()}
+    input = {k: v[:-2] for k, v in seq.items() if k in ['logit', 'stoch', 'deter', 'skill', 'feat']}
+    policy = self.actor(sg(input))
     if self.config.actor_grad == 'dynamics':
       objective = target[1:]
     elif self.config.actor_grad == 'reinforce':

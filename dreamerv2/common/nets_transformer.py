@@ -189,11 +189,8 @@ class PolicyMLP(common.Module):
     self._act = common.nets.get_act(act)
     self._out = out
 
-  def __call__(self, features, em=None):
-    reshape = len(features.shape)==2
-    if reshape: features=features[None,:]
-    mem_seq = em.retrieve_seqs(features)[0]
-    features = tf.concat((tf.stop_gradient(features), mem_seq), -1)
+  def __call__(self, input):
+    features = tf.concat([v for k, v in input.items()], -1)
 
     x = tf.cast(features, prec.global_policy().compute_dtype)
     x = x.reshape([-1, x.shape[-1]])
@@ -202,5 +199,32 @@ class PolicyMLP(common.Module):
       x = self.get(f'norm{index}', common.nets.NormLayer, self._norm)(x)
       x = self._act(x)
     x = x.reshape(features.shape[:-1] + [x.shape[-1]])
-    x = x[0] if reshape else x
+    return self.get('out', common.nets.DistLayer, self._shape, **self._out)(x)
+
+class PolicyHierarchy(common.Module):
+
+  def __init__(self, shape, layers, units, act='elu', norm='none', **out):
+    self._shape = (shape,) if isinstance(shape, int) else shape
+    self._layers = layers
+    self._units = units
+    self._norm = norm
+    self._act = common.nets.get_act(act)
+    self._out = out
+
+  def __call__(self, input):
+    flatten = lambda x: x.reshape(list(x.shape[:2]) + [-1])
+    state = {k: v for k, v in input.items() if k in ['logit', 'stoch', 'deter']}
+    state = {k: flatten(v) for k, v in state.items()}
+    goal = self.get(f'dec', common.nets.MLP, shape=input['feat'].shape[2], layers=self._layers, units=self._units)(input['skill']).mode()
+    delta = goal - input['feat']
+    features = {**state, 'goal': goal, 'delta': delta}
+    features = tf.concat([v for k, v in features.items()], -1)
+
+    x = tf.cast(features, prec.global_policy().compute_dtype)
+    x = x.reshape([-1, x.shape[-1]])
+    for index in range(self._layers):
+      x = self.get(f'dense{index}', tfkl.Dense, self._units)(x)
+      x = self.get(f'norm{index}', common.nets.NormLayer, self._norm)(x)
+      x = self._act(x)
+    x = x.reshape(features.shape[:-1] + [x.shape[-1]])
     return self.get('out', common.nets.DistLayer, self._shape, **self._out)(x)

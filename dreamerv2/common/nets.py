@@ -336,7 +336,7 @@ class GRUCell(tf.keras.layers.AbstractRNNCell):
     if self._norm:
       dtype = parts.dtype
       parts = tf.cast(parts, tf.float32)
-      parts = self._norm(parts)
+      # parts = self._norm(parts)
       parts = tf.cast(parts, dtype)
     reset, cand, update = tf.split(parts, 3, -1)
     reset = tf.nn.sigmoid(reset)
