@@ -251,7 +251,8 @@ class ActorCritic(common.Module):
     # training the action that led into the first step anyway, so we can use
     # them to scale the whole sequence.
     with tf.GradientTape() as actor_tape:
-      seq = wm.imagine(self.actor, em, start, is_terminal, hor)
+      idx = tf.random.uniform((), minval=0, maxval=self.config.dataset.batch, dtype=tf.int32).numpy()
+      seq = wm.imagine(self.actor, em, {k: v[None, idx] for k, v in start.items()}, is_terminal[None, idx], hor)
       reward = reward_fn(seq)
       seq['reward'], mets1 = self.rewnorm(reward)
       mets1 = {f'reward_{k}': v for k, v in mets1.items()}
