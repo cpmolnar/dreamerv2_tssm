@@ -134,3 +134,6 @@ dmypy.json
 .__pycache__
 .dreamerv2.egg-info
 .vscode
+
+dv2em-venv/*
+dreamerv2/logdir/*
