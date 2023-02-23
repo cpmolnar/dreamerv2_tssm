@@ -7,10 +7,10 @@ sys.path.append(str(pathlib.Path(__file__).parent.parent))
 import dreamerv2.api as dv2
 from dreamerv2.train_with_configs import main
 
-logdir_path = r'C:\Users\Carl\OneDrive\Desktop'
+logdir_path = r'/home/paperspace/dreamerv2_tssm/dreamerv2'
 task = 'crafter_reward'
 ssm_type = 'rssm_em'
-exp_name = '_exp'
+exp_name = ''
 
 config = dv2.defaults.update({
     'task': task,
@@ -18,7 +18,7 @@ config = dv2.defaults.update({
     'time_limit': 100,
     'eval_every': 100,
     'log_every': 100,
-    'prefill': 100,
+    'prefill': 10000,
     'pretrain': 1,
     'train_steps': 1,
     # 'logdir': f'{logdir_path}/logdir/{task}/{ssm_type}',
@@ -39,9 +39,10 @@ config = dv2.defaults.update({
     'model_opt.lr': 1e-4,
     'actor_opt.lr': 1e-4,
     'critic_opt.lr': 1e-4,
-    '.*\.norm': 'layer',
+    # '.*\.norm': 'layer',
 
     'episodic_memory.max_size': 128,
+    # 'episodic_memory.verbose': True,
     'dataset.batch': 8, 
     'dataset.length': 50,
     'load_model': False
