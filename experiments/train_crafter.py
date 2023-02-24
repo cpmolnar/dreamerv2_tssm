@@ -7,7 +7,7 @@ sys.path.append(str(pathlib.Path(__file__).parent.parent))
 import dreamerv2.api as dv2
 from dreamerv2.train_with_configs import main
 
-logdir_path = r'C:\Users\Carl\OneDrive\Desktop'
+logdir_path = r'/home/paperspace/dreamerv2_tssm/dreamerv2'
 task = 'crafter_reward'
 ssm_type = 'rssm_em'
 exp_name = ''
@@ -42,6 +42,7 @@ config = dv2.defaults.update({
     # '.*\.norm': 'layer',
 
     'episodic_memory.max_size': 128,
+    # 'episodic_memory.verbose': True,
     'dataset.batch': 8, 
     'dataset.length': 50,
     'load_model': True

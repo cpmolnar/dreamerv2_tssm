@@ -176,6 +176,7 @@ def main(config):
   train_agent(next(train_dataset))
   if (logdir / 'variables.pkl').exists():
     agnt.load(logdir / 'variables.pkl')
+    if config.ssm_type=='rssm_em': agnt.em.load(logdir)
   else:
     print('Pretrain agent.')
     for _ in range(config.pretrain):
@@ -205,6 +206,7 @@ def main(config):
     print('Start training.')
     train_driver(train_policy, steps=config.eval_every)
     agnt.save(logdir / 'variables.pkl')
+    if config.ssm_type=='rssm_em': agnt.em.save(logdir)
   for env in train_envs + eval_envs:
     try:
       env.close()
