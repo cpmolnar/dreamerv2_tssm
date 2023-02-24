@@ -54,15 +54,15 @@ class RaggedMultiHeadAttention(common.Module):
         self.d_k = d_k
         self.d_v = d_v
 
-        self.w_qs = tfkl.Dense(n_head * d_k, use_bias=False)
-        self.w_ks = tfkl.Dense(n_head * d_k, use_bias=False)
-        self.w_vs = tfkl.Dense(n_head * d_v, use_bias=False)
-        self.fc = tfkl.Dense(d_v, use_bias=False)
+        # self.w_qs = tfkl.Dense(n_head * d_k, use_bias=False)
+        # self.w_ks = tfkl.Dense(n_head * d_k, use_bias=False)
+        # self.w_vs = tfkl.Dense(n_head * d_v, use_bias=False)
+        # self.fc = tfkl.Dense(d_v, use_bias=False)
 
         self.attention = ScaledDotProductAttention(temperature=d_k ** 0.5)
 
-        self.dropout = tfkl.Dropout(dropout)
-        self.layer_norm = tfkl.LayerNormalization(epsilon=1e-6)
+        # self.dropout = tfkl.Dropout(dropout)
+        # self.layer_norm = tfkl.LayerNormalization(epsilon=1e-6)
 
 
     def __call__(self, q, k, v, mask=None, method='default', combination='default'):
@@ -78,9 +78,12 @@ class RaggedMultiHeadAttention(common.Module):
 
         # Pass through the pre-attention projection: b x lq x (n*dv)
         # Separate different heads: b x lq x n x dv
-        q = self.w_qs(q).reshape((sz_b, n_head, d_k))
-        k = self.w_ks(k).reshape((sz_t, n_head, d_k))
-        v = self.w_vs(v).reshape((sz_t, n_head, d_v))
+        # q = self.w_qs(q).reshape((sz_b, n_head, d_k))
+        # k = self.w_ks(k).reshape((sz_t, n_head, d_k))
+        # v = self.w_vs(v).reshape((sz_t, n_head, d_v))
+        q = q.reshape((sz_b, n_head, d_k))
+        k = k.reshape((sz_t, n_head, d_k))
+        v = v.reshape((sz_t, n_head, d_v))
 
         # Transpose for attention dot product: b x n x dv
         # q, k, v = tf.transpose(q, [0, 2, 1, 3]), tf.transpose(k, [0, 2, 3]), tf.transpose(v, [0, 2, 3])
@@ -92,10 +95,10 @@ class RaggedMultiHeadAttention(common.Module):
         # Transpose to move the head dimension back: b x lq x n x dv
         # Combine the last two dimensions to concatenate all the heads together: b x lq x (n*dv)
         # q = q.reshape((sz_b, len_q, -1))
-        q = self.dropout(self.fc(q))
+        # q = self.dropout(self.fc(q))
         # q += residual
 
-        q = self.layer_norm(q)
+        # q = self.layer_norm(q)
 
         return q.reshape([batch_size, seq_len, n_feats]), attn
     
