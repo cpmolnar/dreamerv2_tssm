@@ -187,7 +187,10 @@ class RaggedEpisodicMemory(common.Module):
         target_idxs = tf.argmax(v[:,1:], axis=-1) + 1
         targets = tf.gather_nd(k, tf.stack((tf.range(len(k), dtype=tf.int64), target_idxs), 1))
 
-        values = tf.ragged.stack([tf.repeat(targets[i][None,:], target_idx, 0) for i, target_idx in enumerate(target_idxs)])
+        values = []
+        for target, target_idx in zip(targets, target_idxs): 
+            values.append(tf.repeat(tf.expand_dims(target, 0), target_idx, axis=0))
+        values = tf.ragged.stack(values)
         keys = tf.ragged.stack([k[i][:target_idxs[i]] for i in np.arange(len(idxs))])
 
         value_rewards = tf.concat([v[i, :target_idx+1].sum()[None,] for i, target_idx in enumerate(target_idxs)], 0)
