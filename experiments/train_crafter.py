@@ -14,7 +14,7 @@ exp_name = ''
 
 config = dv2.defaults.update({
     'task': task,
-    'jit': False,
+    'jit': True,
     'time_limit': 100,
     'eval_every': 100,
     'log_every': 100,
@@ -45,7 +45,7 @@ config = dv2.defaults.update({
     # 'episodic_memory.verbose': True,
     'dataset.batch': 8, 
     'dataset.length': 50,
-    'load_model': False
+    'load_model': True
 }).parse_flags()
 
 main(config)
