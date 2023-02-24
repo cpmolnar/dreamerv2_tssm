@@ -215,9 +215,8 @@ class PolicyHierarchy(common.Module):
     flatten = lambda x: x.reshape(list(x.shape[:2]) + [-1])
     state = {k: v for k, v in input.items() if k in ['logit', 'stoch', 'deter']}
     state = {k: flatten(v) for k, v in state.items()}
-    goal = self.get(f'dec', common.nets.MLP, shape=input['feat'].shape[2], layers=self._layers, units=self._units)(input['skill']).mode()
-    delta = goal - input['feat']
-    features = {**state, 'goal': goal, 'delta': delta}
+    # goal = self.get(f'dec', common.nets.MLP, shape=input['feat'].shape[2], layers=self._layers, units=self._units)(input['skill']).mode()
+    features = {'stoch': state['stoch'], 'deter': state['deter'], 'goal': input['skill']}
     features = tf.concat([v for k, v in features.items()], -1)
 
     x = tf.cast(features, prec.global_policy().compute_dtype)
