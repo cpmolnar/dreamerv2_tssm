@@ -11,7 +11,7 @@ from dreamerv2.train_with_configs import main
 logdir_path = r'C:/Users/Carl/OneDrive/Desktop'
 task = 'crafter_reward'
 ssm_type = 'rssm_em'
-exp_name = ''
+exp_name = '_pf100'
 
 config = dv2.defaults.update({
     'task': task,
@@ -41,12 +41,14 @@ config = dv2.defaults.update({
     'actor_opt.lr': 1e-4,
     'critic_opt.lr': 1e-4,
     # '.*\.norm': 'layer',
+    'expl_behavior': 'greedy',#'Plan2Explore'
 
-    'episodic_memory.max_size': 128,
+
+    'episodic_memory.max_size': 1024,
     # 'episodic_memory.verbose': True,
     'dataset.batch': 8, 
     'dataset.length': 50,
-    'load_model': False
+    'load_model': True
 }).parse_flags()
 
 main(config)

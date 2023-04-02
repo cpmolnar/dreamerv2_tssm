@@ -32,14 +32,18 @@ class Agent(common.Module):
     if state is None:
       latent = self.wm.rssm.initial(len(obs['reward']))
       action = tf.zeros((len(obs['reward']),) + self.act_space.shape)
-      state = latent, action
-    latent, action = state
+      state = latent, action, None
+    latent, action, prev_skill = state
     embed = self.wm.encoder(self.wm.preprocess(obs))
     sample = (mode == 'train') or not self.config.eval_state_mean
     latent, _ = self.wm.rssm.obs_step(
         latent, action, embed, obs['is_first'], sample)
     latent_exp = {k: tf.expand_dims(v, 0) for k, v in latent.items()}
     feat = self.wm.rssm.get_feat(latent_exp)
+    # if prev_skill is not None:
+    #   skill_rew = tf.map_fn(lambda i: max_cosine_sim(prev_skill[:,i], feat[:,i])[0, 0], tf.range(feat.shape[1]), fn_output_signature=tf.float32)[0]
+    #   skill = tf.where(tf.expand_dims(tf.math.logical_or((skill_rew==0), (skill_rew>0.9)), -1), self.em.retrieve_skill(feat), prev_skill)
+    # else:
     skill = self.em.retrieve_skill(feat)
     input = {**latent_exp, 'skill': skill, 'feat': feat}
     if mode == 'eval':
@@ -56,7 +60,7 @@ class Agent(common.Module):
       noise = self.config.expl_noise
     action = common.action_noise(action, noise, self.act_space)[0]
     outputs = {'action': action}
-    state = (latent, action)
+    state = (latent, action, skill)
     return outputs, state
 
   @tf.function
@@ -65,12 +69,12 @@ class Agent(common.Module):
     state, outputs, mets = self.wm.train(data, state)
     metrics.update(mets)
     start = outputs['post']
-    reward = lambda seq: self.wm.heads['reward'](seq['feat']).mode()
     if update_mem:
       keys = self.wm.rssm.get_feat(start)
       values = data['reward'][:,:,None]
       self.em.cleanup()
       self.em.add_seqs(keys, values)
+    reward = lambda seq: self.wm.heads['reward'](seq['feat']).mode()
     metrics.update(self._task_behavior.train(
         self.wm, self.em, start, data['is_terminal'], reward))
     if self.config.expl_behavior != 'greedy':
@@ -84,7 +88,7 @@ class Agent(common.Module):
     data = self.wm.preprocess(data)
     for key in self.wm.heads['decoder'].cnn_keys:
       name = key.replace('/', '_')
-      report[f'openl_{name}'] = self.wm.video_pred(data, key)
+      report[f'openl_{name}'] = self.wm.video_pred(data, key, self.em)
     return report
 
 
@@ -105,19 +109,23 @@ class WorldModel(common.Module):
       assert name in self.heads, name
     self.model_opt = common.Optimizer('model', **config.model_opt)
 
-  def train(self, data, state=None):
+  def train(self, data, state=None, em=None):
     with tf.GradientTape() as model_tape:
-      model_loss, state, outputs, metrics = self.loss(data, state)
+      model_loss, state, outputs, metrics = self.loss(data, state, em)
     modules = [self.encoder, self.rssm, *self.heads.values()]
     metrics.update(self.model_opt(model_tape, model_loss, modules))
     return state, outputs, metrics
 
-  def loss(self, data, state=None):
+  def loss(self, data, state=None, em=None):
     data = self.preprocess(data)
     embed = self.encoder(data) # z_t
     post, prior = self.rssm.observe(
         embed, data['action'], data['is_first'], state) # out: z_t\hat, z_t. in: z_t, a_t
     kl_loss, kl_value = self.rssm.kl_loss(post, prior, **self.config.kl)
+    state_feat = self.rssm.get_feat(state)
+    skill = em.retrieve_skill(state_feat)
+    feat = self.rssm.get_feat(prior)
+    data['reward'] -= tf.norm(skill - feat, axis=-1)
     assert len(kl_loss.shape) == 0
     likes = {}
     losses = {'kl': kl_loss}
@@ -153,13 +161,17 @@ class WorldModel(common.Module):
     seq = {k: [v] for k, v in start.items()}
     seq['feat'] = [feat]
     seq['skill'] = [skill]
+    seq['skill_rew'] = [tf.zeros(shape=(skill.shape[:2]))]
     for _ in range(horizon):
       input = {k: v[-1] for k, v in seq.items() if k in ['logit', 'stoch', 'deter', 'skill', 'feat']}
       action = policy(sg(input)).sample()
       state = self.rssm.img_step({k: v[-1] for k, v in seq.items()}, action)
       feat = self.rssm.get_feat(state)
+      # skill_rew = tf.map_fn(lambda i: max_cosine_sim(input['skill'][:,i], feat[:,i])[0, 0], tf.range(feat.shape[1]), fn_output_signature=tf.float32)[None]
+      skill_rew = -tf.norm(input['skill'] - feat, axis=-1)
+      # skill = tf.where(tf.expand_dims(tf.math.logical_or((skill_rew==0), (skill_rew>0.9)), -1), em.retrieve_skill(feat), input['skill'])
       skill = em.retrieve_skill(feat)
-      for key, value in {**state, 'action': action, 'skill': skill, 'feat': feat}.items():
+      for key, value in {**state, 'action': action, 'skill': skill, 'feat': feat, 'skill_rew': skill_rew}.items():
         seq[key].append(value)
     seq = {k: tf.stack(v, 0) for k, v in seq.items()}
     if 'discount' in self.heads:
@@ -201,19 +213,26 @@ class WorldModel(common.Module):
     return obs
 
   @tf.function
-  def video_pred(self, data, key):
+  def video_pred(self, data, key, em):
     decoder = self.heads['decoder']
     truth = data[key][:6] + 0.5
     embed = self.encoder(data) # x_t
     states, _ = self.rssm.observe(
         embed[:6, :5], data['action'][:6, :5], data['is_first'][:6, :5]) # get z_t, h_t
-    recon = decoder(self.rssm.get_feat(states))[key].mode()[:6] # get x_t\hat
+    start_feat = self.rssm.get_feat(states)
+    recon = decoder(start_feat)[key].mode()[:6] # get x_t\hat
     init = {k: v[:, -1] for k, v in states.items()}
     prior = self.rssm.imagine(data['action'][:6, 5:], init)
-    openl = decoder(self.rssm.get_feat(prior))[key].mode()
+    imag_feat = self.rssm.get_feat(prior)
+    openl = decoder(imag_feat)[key].mode()
+
+    feat = tf.concat([start_feat, imag_feat], 1)
+    skill = em.retrieve_skill(feat)
+    goal_model = decoder(skill)[key].mode() + 0.5
+
     model = tf.concat([recon[:, :5] + 0.5, openl + 0.5], 1)
     error = (model - truth + 1) / 2
-    video = tf.concat([truth, model, error], 2)
+    video = tf.concat([truth, model, error, goal_model], 2)
     B, T, H, W, C = video.shape
     return video.transpose((1, 2, 0, 3, 4)).reshape((T, H, B * W, C))
 
@@ -251,22 +270,23 @@ class ActorCritic(common.Module):
     # training the action that led into the first step anyway, so we can use
     # them to scale the whole sequence.
     with tf.GradientTape() as actor_tape:
-      idx = tf.random.uniform((), minval=0, maxval=self.config.dataset.batch, dtype=tf.int32).numpy()
+      idx = tf.random.uniform((), minval=0, maxval=self.config.dataset.batch, dtype=tf.int32)
       seq = wm.imagine(self.actor, em, {k: v[None, idx] for k, v in start.items()}, is_terminal[None, idx], hor)
       reward = reward_fn(seq)
       seq['reward'], mets1 = self.rewnorm(reward)
       mets1 = {f'reward_{k}': v for k, v in mets1.items()}
       target, mets2 = self.target(seq)
-      actor_loss, mets3 = self.actor_loss(seq, target, em)
+      actor_loss, mets3 = self.actor_loss(seq, target)
     with tf.GradientTape() as critic_tape:
       critic_loss, mets4 = self.critic_loss(seq, target)
     metrics.update(self.actor_opt(actor_tape, actor_loss, self.actor))
     metrics.update(self.critic_opt(critic_tape, critic_loss, self.critic))
     metrics.update(**mets1, **mets2, **mets3, **mets4)
+    metrics.update({'skill_rew_mean': seq['skill_rew'].mean()})
     self.update_slow_target()  # Variables exist after first forward pass.
     return metrics
 
-  def actor_loss(self, seq, target, em):
+  def actor_loss(self, seq, target):
     # Actions:      0   [a1]  [a2]   a3
     #                  ^  |  ^  |  ^  |
     #                 /   v /   v /   v
@@ -354,3 +374,9 @@ class ActorCritic(common.Module):
         for s, d in zip(self.critic.variables, self._target_critic.variables):
           d.assign(mix * s + (1 - mix) * d)
       self._updates.assign_add(1)
+
+def max_cosine_sim(x, y):
+  if tf.norm(x, axis=-1)==0 or tf.norm(y, axis=-1)==0: 
+    return tf.zeros(shape=(x.shape[0], y.shape[0]))
+  m = tf.maximum(tf.norm(x, axis=-1), tf.norm(y, axis=-1))
+  return (x/m) @ tf.transpose(y/m)

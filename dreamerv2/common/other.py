@@ -5,7 +5,6 @@ import time
 
 import numpy as np
 import tensorflow as tf
-tf.config.run_functions_eagerly(True)
 from tensorflow_probability import distributions as tfd
 
 from . import dists
